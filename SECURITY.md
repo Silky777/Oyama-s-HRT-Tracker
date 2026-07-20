@@ -1,136 +1,58 @@
-# Security Documentation
+# Security model
 
-This document outlines the security measures implemented in this application and provides guidance for secure deployment.
+## Trust boundary
 
-## Security Improvements Implemented
+This is a single-user application. Cloudflare Access must protect
+`hrt.silky.moe`; the app contains no login or account system of its own.
+`workers_dev = false` prevents the default Worker hostname from bypassing the
+custom-host Access policy.
 
-### 1. JWT Secret Validation
-- **Issue**: Application previously used a weak fallback secret (`'fallback-secret'`) if `JWT_SECRET` environment variable was not set
-- **Fix**: Added `validateJWTSecret()` function that:
-  - Ensures `JWT_SECRET` is set
-  - Rejects secrets shorter than 32 characters
-  - Rejects the hardcoded fallback value
-  - Throws an error on startup if requirements are not met
-- **Impact**: Prevents deployment with weak JWT secrets
+`e.silky.moe` is intentionally public. The Worker returns 404 for `/api/state`
+on that host. `/api/public` contains only a modeled current level, unit, mode,
+timestamps, and curve points. Raw doses, labs, templates, settings, and D1
+history are not included.
 
-### 2. Timing Attack Protection
-- **Issue**: Admin password comparison used simple string equality (`===`), vulnerable to timing attacks
-- **Fix**: Implemented `timingSafeEqual()` function for constant-time string comparison
-- **Impact**: Prevents attackers from using timing analysis to guess admin credentials
+## Defense in depth
 
-### 3. Rate Limiting
-- **Issue**: No rate limiting on authentication endpoints allowed brute-force attacks
-- **Fix**: Added rate limiting with:
-  - 5 requests per minute per IP for `/api/login` and `/api/register`
-  - Returns HTTP 429 (Too Many Requests) when limit exceeded
-  - Includes `Retry-After` header
-  - Automatic cleanup of expired entries to prevent memory leaks (max 10,000 entries)
-  - Rejects requests without identifiable IP to prevent rate limit bypass
-- **Impact**: Significantly reduces brute-force attack effectiveness
-- **Note**: This is an in-memory implementation suitable for single-instance deployments
+Setting both `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` makes the Worker verify the
+Cloudflare Access JWT on every `/api/state` request. If either value is absent,
+the Worker trusts Access at the edge. Keep `workers_dev` disabled in that mode.
 
-### 4. Input Validation
-- **Issue**: No validation of username format or password strength
-- **Fix**: Added validation functions:
-  - `validateUsername()`: Ensures 3-30 characters, alphanumeric plus underscore and hyphen
-  - `validatePassword()`: Enforces 8-128 character length
-- **Impact**: Prevents injection attacks and ensures basic password security
+The state API:
 
-### 5. Content-Type Validation
-- **Issue**: Endpoints accepting JSON did not validate Content-Type header
-- **Fix**: Added Content-Type validation for all JSON endpoints
-- **Impact**: Prevents potential CSRF and content-type confusion attacks
+- accepts only the canonical two-mode state shape;
+- limits serialized state to 1.5 MB;
+- uses parameterized D1 statements;
+- responds with `Cache-Control: no-store`;
+- supports an optional `baseUpdatedAt` optimistic-concurrency check;
+- writes the previous value to a rolling 20-entry history in the same D1 batch.
 
-### 6. Username Enumeration Protection
-- **Issue**: Different error messages for non-existent users vs wrong password
-- **Fix**: Returns generic "Invalid credentials" message in both cases
-- **Impact**: Prevents attackers from determining valid usernames
+The deployed responses include a same-origin Content Security Policy, framing
+protection, a no-referrer policy, and restrictive browser permissions. The API
+does not enable cross-origin reads.
 
-### 7. Response Headers
-- **Issue**: Missing Content-Type headers in JSON responses
-- **Fix**: Added `Content-Type: application/json` to all JSON responses
-- **Impact**: Prevents content-type confusion attacks
+## Cloudflare Access setup
 
-## Security Configuration Requirements
+Use an email/identity allow policy for the editor host. Cloudflare One-time PIN
+can provide a PIN-based sign-in while keeping verification at Cloudflare. Never
+put a reusable passcode in frontend code, a public Worker variable, or the D1
+state document.
 
-### Required Environment Variables
+The public host must be excluded from the Access application so visitors can
+load the dashboard. Confirm after deployment that:
 
-1. **JWT_SECRET** (Required)
-   - Must be at least 32 characters long
-   - Should be cryptographically random
-   - Example generation: `openssl rand -base64 48`
-   - **NEVER** commit this to version control
+- unauthenticated `hrt.silky.moe` requests are intercepted by Access;
+- `e.silky.moe/api/state` returns 404;
+- `e.silky.moe/api/public` contains no dose or lab fields;
+- the `*.workers.dev` route is unavailable.
 
-2. **ADMIN_USERNAME** (Optional)
-   - If set, enables admin access via environment variables
-   - Should be unique and not easily guessable
+## Data recovery
 
-3. **ADMIN_PASSWORD** (Optional)
-   - If set alongside ADMIN_USERNAME, enables admin login
-   - Should be strong and unique
-   - Store securely (e.g., in Cloudflare Workers secrets)
+The old auth tables are not dropped by the migration. The active state is in
+`app_state`; the previous 20 versions are in `state_history`. Treat D1 exports as
+sensitive because those tables contain raw treatment records.
 
-### Deployment Checklist
+## Reporting
 
-- [ ] Generate a strong JWT_SECRET (at least 32 characters)
-- [ ] Configure JWT_SECRET in your deployment environment
-- [ ] If using admin account, set strong ADMIN_USERNAME and ADMIN_PASSWORD
-- [ ] Verify CORS configuration matches your deployment needs
-- [ ] Enable HTTPS (should be automatic with Cloudflare Workers)
-- [ ] Review rate limiting settings for your expected traffic
-- [ ] Monitor authentication logs for suspicious activity
-
-## Known Security Considerations
-
-### CORS Configuration
-The application currently uses `Access-Control-Allow-Origin: *` which allows requests from any origin. This is appropriate for a public-facing API where authentication is handled via JWT tokens. However, consider restricting this to specific domains in production if your use case allows.
-
-### Rate Limiting
-The current rate limiting implementation is in-memory and will be reset when the worker restarts. For production deployments with multiple instances, consider using:
-- Cloudflare Workers KV or Durable Objects for distributed rate limiting
-- Cloudflare's built-in rate limiting features
-
-### Password Strength
-The current password validation enforces a minimum length of 8 characters. Consider implementing additional requirements:
-- At least one uppercase letter
-- At least one lowercase letter
-- At least one number
-- At least one special character
-
-### Session Management
-JWT tokens are set to expire after:
-- Admin tokens: 1 day
-- User tokens: 7 days
-
-Consider implementing:
-- Refresh tokens for longer sessions
-- Token revocation mechanism
-- Session logging and monitoring
-
-### SQL Injection
-The application uses parameterized queries throughout, which provides good protection against SQL injection. Continue to use prepared statements with `.bind()` for all database operations.
-
-### Dependencies
-Regularly update dependencies to patch security vulnerabilities:
-```bash
-npm audit
-npm audit fix
-```
-
-## Security Best Practices
-
-1. **Never commit secrets**: Use environment variables for all sensitive data
-2. **Use HTTPS**: Always deploy with HTTPS enabled (automatic with Cloudflare Workers)
-3. **Monitor logs**: Regularly review authentication and error logs
-4. **Update dependencies**: Keep all packages up to date
-5. **Test security**: Regularly test authentication and authorization logic
-6. **Backup data**: Maintain regular backups of the database
-7. **Incident response**: Have a plan for responding to security incidents
-
-## Reporting Security Issues
-
-If you discover a security vulnerability, please report it to the maintainers privately rather than opening a public issue. This allows for coordinated disclosure and patching.
-
-## License
-
-This security documentation is part of the HRT Recorder Web project and is subject to the same MIT License.
+Report security issues privately to the repository owner. Do not include real
+treatment data, Cloudflare Access assertions, or D1 exports in a public issue.

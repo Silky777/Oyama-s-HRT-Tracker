@@ -1432,7 +1432,7 @@ function computeMaxLifetimeH(params: PKParams, route: Route, allEvents: DoseEven
     return Math.ceil(13.816 / kMin);
 }
 
-export function runSimulation(events: DoseEvent[], bodyWeightKG: number): SimulationResult | null {
+export function runSimulation(events: DoseEvent[], bodyWeightKG: number, futureHorizonH = 24): SimulationResult | null {
     if (events.length === 0 || bodyWeightKG <= 0) return null;
 
     const sortedEvents = [...events].sort((a, b) => a.timeH - b.timeH);
@@ -1449,7 +1449,7 @@ export function runSimulation(events: DoseEvent[], bodyWeightKG: number): Simula
     const nowH = Date.now() / (1000 * 60 * 60);
     const endTime = Math.max(
         sortedEvents[sortedEvents.length - 1].timeH + (24 * 14),
-        nowH + 24
+        nowH + Math.max(24, futureHorizonH)
     );
     // Adaptive step count: at least 1 point per hour, minimum 2000. The cap only
     // guards against a pathological/malformed event time (e.g. a bad timestamp

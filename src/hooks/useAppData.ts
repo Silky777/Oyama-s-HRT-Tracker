@@ -30,6 +30,8 @@ export interface QuickDose {
 export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: string, onConfirm?: () => void) => void) => {
     const { t, lang } = useTranslation();
     const { mode, isTransmasc } = useHRTMode();
+    const modeRef = useRef(mode);
+    modeRef.current = mode;
 
     const loadJSON = <T,>(key: string, fallback: T): T => {
         try {
@@ -45,6 +47,8 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         const saved = localStorage.getItem('hrt-weight');
         return saved ? parseFloat(saved) : 70.0;
     });
+    const weightRef = useRef(weight);
+    weightRef.current = weight;
     const [labResults, setLabResults] = useState<LabResult[]>(() => loadJSON(keyFor(mode, 'lab-results'), [] as LabResult[]));
     const [calibrationMethod, setCalibrationMethodState] = useState<CalibrationMethod>(() =>
         // Hybrid-MIPD is the default; legacy 'average'/'adaptive' values are migrated.
@@ -616,6 +620,102 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         };
     };
 
+    // --- Server sync helpers (single-user, server = source of truth) ---
+    // Build the full canonical blob purely from localStorage (both modes) plus
+    // the shared settings. Reading mode-scoped arrays from localStorage — rather
+    // than in-memory state — keeps the payload consistent even mid mode-switch,
+    // and matches how the localStorage persistence effects have already flushed.
+    const buildServerPayload = () => {
+        const readMode = (m: 'transfem' | 'transmasc') => ({
+            events: loadJSON<DoseEvent[]>(keyFor(m, 'events'), []),
+            labResults: loadJSON<LabResult[]>(keyFor(m, 'lab-results'), []),
+            doseTemplates: loadJSON<DoseTemplate[]>(keyFor(m, 'dose-templates'), []),
+            quickDoses: loadJSON<QuickDose[]>(keyFor(m, 'quick-doses'), []),
+        });
+        const modes = {
+            transfem: readMode('transfem'),
+            transmasc: readMode('transmasc'),
+        };
+        const w = parseFloat(localStorage.getItem('hrt-weight') || '');
+        let pk: PKCustomParams | undefined;
+        try { const s = localStorage.getItem('hrt-pk-params'); pk = s ? (JSON.parse(s) as PKCustomParams) : undefined; } catch { pk = undefined; }
+        const calM = normalizeCalibrationMethod(localStorage.getItem('hrt-cal-method'));
+        const calH: CalibrationHistoryMode = localStorage.getItem('hrt-cal-history-mode') === 'forward' ? 'forward' : 'retrospective';
+        const activeMode = modeRef.current;
+        return {
+            meta: { version: 2, exportedAt: new Date().toISOString() },
+            mode: activeMode,
+            weight: Number.isFinite(w) && w > 0 ? w : weightRef.current,
+            modes,
+            events: modes[activeMode].events,
+            labResults: modes[activeMode].labResults,
+            doseTemplates: modes[activeMode].doseTemplates,
+            pkParams: pk,
+            calibrationMethod: calM,
+            calibrationHistoryMode: calH,
+        };
+    };
+
+    // A stable string of the syncable content (excludes the volatile `meta`
+    // timestamp) so change-detection doesn't fire on every render.
+    const stateSignature = () => {
+        const p = buildServerPayload();
+        return JSON.stringify({
+            modes: p.modes,
+            weight: p.weight,
+            pkParams: p.pkParams ?? null,
+            calibrationMethod: p.calibrationMethod,
+            calibrationHistoryMode: p.calibrationHistoryMode,
+        });
+    };
+
+    // Apply a server (or imported) payload as the new local truth. Writes both
+    // modes + shared settings to localStorage synchronously (so an immediately
+    // following stateSignature() is accurate) and pushes the active mode into
+    // React state for the UI.
+    const hydrateFromServer = (payload: any) => {
+        if (!payload || typeof payload !== 'object') return;
+        const modesBlock = (payload.modes && typeof payload.modes === 'object') ? payload.modes : null;
+        const applyMode = (m: 'transfem' | 'transmasc') => {
+            const b = modesBlock ? modesBlock[m] : null;
+            const evs = b && Array.isArray(b.events) ? sanitizeImportedEvents(b.events) : [];
+            const ls = b && Array.isArray(b.labResults) ? sanitizeImportedLabResults(b.labResults) : [];
+            const tmps = b && Array.isArray(b.doseTemplates) ? sanitizeImportedTemplates(b.doseTemplates) : [];
+            const quick = b && Array.isArray(b.quickDoses)
+                ? b.quickDoses.filter((item: any): item is QuickDose => (
+                    item && typeof item === 'object' && typeof item.id === 'string' &&
+                    Object.values(Route).includes(item.route) && Object.values(Ester).includes(item.ester) &&
+                    Number.isFinite(Number(item.value))
+                )).map((item: QuickDose) => ({ ...item, value: Number(item.value) }))
+                : [];
+            localStorage.setItem(keyFor(m, 'events'), JSON.stringify(evs));
+            localStorage.setItem(keyFor(m, 'lab-results'), JSON.stringify(ls));
+            localStorage.setItem(keyFor(m, 'dose-templates'), JSON.stringify(tmps));
+            localStorage.setItem(keyFor(m, 'quick-doses'), JSON.stringify(quick));
+            return { evs, ls, tmps, quick };
+        };
+        const tf = applyMode('transfem');
+        const tm = applyMode('transmasc');
+        const active = modeRef.current === 'transmasc' ? tm : tf;
+
+        if (typeof payload.weight === 'number' && payload.weight > 0) localStorage.setItem('hrt-weight', String(payload.weight));
+        if (payload.pkParams && typeof payload.pkParams === 'object') localStorage.setItem('hrt-pk-params', JSON.stringify(payload.pkParams));
+        else localStorage.removeItem('hrt-pk-params');
+        if (payload.calibrationMethod) localStorage.setItem('hrt-cal-method', normalizeCalibrationMethod(payload.calibrationMethod));
+        if (payload.calibrationHistoryMode === 'forward' || payload.calibrationHistoryMode === 'retrospective') {
+            localStorage.setItem('hrt-cal-history-mode', payload.calibrationHistoryMode);
+        }
+
+        setEvents(active.evs);
+        setLabResults(active.ls);
+        setDoseTemplates(active.tmps);
+        setQuickDoses(active.quick);
+        if (typeof payload.weight === 'number' && payload.weight > 0) setWeight(payload.weight);
+        setPkParamsState(payload.pkParams && typeof payload.pkParams === 'object' ? payload.pkParams : null);
+        setCalibrationMethodState(normalizeCalibrationMethod(payload.calibrationMethod));
+        setCalibrationHistoryModeState(payload.calibrationHistoryMode === 'forward' ? 'forward' : 'retrospective');
+    };
+
     return {
         events, setEvents,
         weight, setWeight,
@@ -643,6 +743,9 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         addQuickDose, deleteQuickDose,
         processImportedData,
         mergeImportedData,
-        buildExportPayload
+        buildExportPayload,
+        buildServerPayload,
+        stateSignature,
+        hydrateFromServer
     };
 };

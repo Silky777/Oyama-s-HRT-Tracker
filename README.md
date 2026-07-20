@@ -1,176 +1,127 @@
-# HRT Recorder Web
+# HRT Tracker
 
-**HRT Recorder Web** — A privacy-focused, web-based tool for simulating and tracking estradiol levels during Hormone Replacement Therapy (HRT).
+A single-user HRT dose tracker and pharmacokinetic level simulator. The editor is
+served at `hrt.silky.moe` behind Cloudflare Access; the read-only public dashboard
+is served at `e.silky.moe`.
 
-**HRT Recorder Web**（HRT 网页记录工具）——一个注重隐私的网页工具，用于在激素替代疗法（HRT）期间模拟和追踪雌二醇水平。
+## How it works
 
----
+- D1 is the source of truth for doses, labs, templates, quick-dose presets, body
+  weight, calibration settings, and PK overrides.
+- The browser keeps a write-through `localStorage` cache for fast startup and
+  offline edits. Failed saves retry when connectivity returns.
+- There is no in-app account, password, session, 2FA, passkey, admin, avatar, or
+  multi-user stack. Cloudflare Access protects the editor host.
+- The public API computes the estimated hormone curve inside the Worker. It
+  returns only the current modeled level and curve points, never doses or labs.
+- English is the default language. The existing language picker remains.
 
-## Algorithm & Core Logic 算法逻辑
+The Worker stores one canonical JSON document in `app_state` and keeps the 20
+most recent prior documents in `state_history` for recovery.
 
-The pharmacokinetic algorithms, mathematical models, and parameters used in this simulation are derived directly from the **[HRT-Recorder-PKcomponent-Test](https://github.com/LaoZhong-Mihari/HRT-Recorder-PKcomponent-Test)** repository.
+## Local development
 
-本模拟中使用的药代动力学算法、数学模型与相关参数，直接来源于 **[HRT-Recorder-PKcomponent-Test](https://github.com/LaoZhong-Mihari/HRT-Recorder-PKcomponent-Test)** 仓库。
+The repository's primary package manager is Bun 1.2.15, matching Cloudflare's
+Workers Builds image. `bun.lock` is committed and should remain synchronized.
 
-We strictly adhere to the `PKcore.swift` and `PKparameter.swift` logic provided by **@LaoZhong-Mihari**, ensuring that the web simulation matches the accuracy of the original native implementation (including 3-compartment models, two-part depot kinetics, and specific sublingual absorption tiers).
+```bash
+bun install --frozen-lockfile
+bun run wrangler:migrate:local
+bun run build
+bun run wrangler:dev
+```
 
-我们严格遵循 **@LaoZhong-Mihari** 提供的 `PKcore.swift` 与 `PKparameter.swift` 中的逻辑，确保网页端模拟与原生实现在精度上保持一致（包括三室模型、双相肌注库房动力学以及特定的舌下吸收分层等）。
+Open `http://localhost:8787` for the editor. Use
+`http://localhost:8787/?public` to preview the public dashboard.
 
----
+For frontend-only development, `bun run dev` starts Vite on port 3000 and proxies
+`/api` to a separately running Worker on port 8787.
 
-## Features 功能
+`package-lock.json` is also retained because the Docker and desktop GitHub
+Actions builds intentionally use `npm ci`.
 
-- **Multi-Route Simulation**: Supports Injection (Valerate, Benzoate, Cypionate, Enanthate), Oral, Sublingual, Gel, and Patches.
+## Cloudflare deployment
 
-  **多给药途径模拟**：支持注射（戊酸酯 Valerate、苯甲酸酯 Benzoate、环戊丙酸酯 Cypionate、庚酸酯 Enanthate）、口服、舌下、凝胶以及贴片等多种给药方式。
+`wrangler.toml` is configured for both custom hosts and has `workers_dev = false`.
+Before deploying:
 
-- **Real-time Visualization**: Interactive charts showing estimated estradiol concentration (pg/mL) over time.
-
-  **实时可视化**：通过交互式图表展示随时间变化的雌二醇估算浓度（pg/mL）。
-
-- **Sublingual Guidance**: Detailed "Hold Time" and absorption parameter (θ) guidance based on strict medical modeling.
-
-  **舌下服用指导**：基于严格的医学建模，提供详细的"含服时间（Hold Time）"与吸收参数（θ）参考。
-
-- **Privacy First**: All data is stored entirely in your browser's `localStorage`. No data is ever sent to a server.
-
-  **隐私优先**：所有数据都完全存储在你浏览器的 `localStorage` 中，绝不会发送到任何服务器。
-
-- **Internationalization**: Native support for **Simplified Chinese**, **English**, **Cantonese**, **Russian**, **Ukrainian**, and more.
-
-  **多语言支持**：原生支持简体中文、英语、粤语、俄语、乌克兰语等多语言界面。
-
----
-
-## 🧪 Run Locally 本地运行
-
-This project is built with **React** and **TypeScript**, bundled with [Vite](https://vitejs.dev/).
-
-本项目基于 **React** 与 **TypeScript** 构建，使用 [Vite](https://vitejs.dev/) 打包。
-
-1. **Clone the repository 克隆仓库**
-
-   ```bash
-   git clone https://github.com/SmirnovaOyama/Oyama-s-HRT-Tracker.git
-   cd Oyama-s-HRT-Tracker
-   ```
-
-2. **Install dependencies 安装依赖**
+1. Confirm that the D1 database ID and the `silky.moe` zone in `wrangler.toml`
+   are correct.
+2. Apply the non-destructive migration:
 
    ```bash
-   # using npm
-   npm install
-
-   # or using pnpm
-   pnpm install
+   bun run wrangler:migrate:remote
    ```
 
-3. **Start the dev server 运行项目**
+3. In Cloudflare Zero Trust, create or keep an Access application for
+   `hrt.silky.moe` and allow only your email/identity. Do not place
+   `e.silky.moe` behind Access.
+4. In the connected Worker's **Settings > Build**, use:
+
+   - Build command: `bun run build`
+   - Deploy command: `bunx wrangler deploy`
+   - Build variable: `BUN_VERSION=1.2.15`
+
+   For a manual deployment, run:
 
    ```bash
-   npm run dev
-   # or: pnpm dev
+   bun run build
+   bunx wrangler deploy
    ```
 
-   Then open <http://localhost:3000> in your browser.
+### Cloudflare Access verification
 
-   然后在浏览器中打开 <http://localhost:3000>。
+Access at the edge is sufficient when `workers_dev` remains disabled. For
+defense in depth, set these Worker variables in `wrangler.toml`:
 
----
+```toml
+ACCESS_TEAM_DOMAIN = "your-team-name"
+ACCESS_AUD = "your-access-application-audience-tag"
+```
+
+When configured, the Worker verifies `Cf-Access-Jwt-Assertion` for both reads and
+writes to `/api/state`.
+
+For a passcode-like flow, enable Cloudflare Access's One-time PIN identity
+provider and keep the email allow policy. The PIN is issued and checked by
+Cloudflare, so no secret is shipped in this app. A reusable shared static
+passcode is intentionally not implemented because that would recreate an
+in-app authentication system.
+
+## First server seed and existing data
+
+When `app_state` is empty, a device with meaningful cached data seeds D1 from
+that cache. A brand-new empty device deliberately does not create an empty row,
+so it cannot wipe the older browser that still holds your history. Open the
+device containing your newest data first. After D1 has a state row, every device
+hydrates from the server instead of replacing it.
+
+The migration does not delete the old multi-user tables. If important data only
+exists in an old cloud backup, export or inspect it before removing the old
+deployment. Do not blindly copy an encrypted legacy `content.data` value into
+`app_state`; import the decrypted tracker export through the editor instead.
 
 ## Docker
 
-The Docker image runs the complete app locally, including the Worker API, D1
-database, and R2-compatible avatar storage. Data is kept in the project's `./data`
-directory and survives container restarts.
-
-Docker 镜像会在本地运行完整应用，包括 Worker API、D1 数据库和兼容 R2 的头像存储。
-数据直接保存在项目目录的 `./data` 中，容器重启不会丢失。
+The container runs the Worker and a persistent local D1 database without any
+JWT or admin secrets:
 
 ```bash
 cp .env.docker.example .env
-# Replace JWT_SECRET in .env with the output of:
-openssl rand -base64 48
-mkdir -p ./data
-sudo chown 1000:1000 ./data
-docker compose pull
 docker compose up -d
 ```
 
-Then open <http://localhost:8787>. / 然后访问 <http://localhost:8787>。
+Data is stored in `./data`. Open `http://localhost:8787`; add `?public` to preview
+the public dashboard.
 
-To stop the app without deleting its data: / 停止应用但保留数据：
+## Pharmacokinetic model
 
-```bash
-docker compose down
-```
+The pharmacokinetic algorithms and parameters are derived from
+[HRT-Recorder-PKcomponent-Test](https://github.com/LaoZhong-Mihari/HRT-Recorder-PKcomponent-Test),
+including the multi-compartment and route-specific absorption models. Estimated
+levels are informational and are not medical advice or a substitute for lab
+testing and clinician guidance.
 
-To use the image published by GitHub Actions: / 使用 GitHub Actions 发布的镜像：
+## License
 
-```bash
-docker run -d --name hrt-tracker \
-  -p 8787:8787 \
-  --env-file .env \
-  -v "$(pwd)/data:/data" \
-  ghcr.io/xunxunProjects/oyama-s-hrt-tracker-docker:latest
-```
-
-`ADMIN_USERNAME` and `ADMIN_PASSWORD` are optional. When used, set both. The
-container uses Wrangler's local workerd runtime and local persistent D1/R2
-resources; it does not connect to the Cloudflare production database or bucket.
-
-`ADMIN_USERNAME` 与 `ADMIN_PASSWORD` 是可选项；如需管理员账号，请同时设置。
-容器使用 Wrangler 的本地 workerd 运行时以及本地持久化 D1/R2 资源，不会连接
-Cloudflare 生产数据库或存储桶。
-
-The workflow in `.github/workflows/docker-publish.yml` validates pull requests
-and publishes `linux/amd64` and `linux/arm64` images to GitHub Container Registry
-for `main`, version tags, and manual runs.
-
-`.github/workflows/docker-publish.yml` 会在 PR 中验证构建，并在 `main`、版本标签或
-手动运行时向 GitHub Container Registry 发布 `linux/amd64` 与 `linux/arm64` 镜像。
-
----
-
-## Deployment & Hosting 部署与托管
-
-You are **very welcome** to deploy this application to your own personal website, blog, or server!
-
-我们**非常欢迎**你将此应用部署到自己的个人网站、博客或服务器上！
-
-We want this tool to be accessible to everyone who needs it. You do not need explicit permission to host it.
-
-我们希望所有需要这款工具的人都能方便地使用它。你无需额外获得授权即可自行托管与部署。
-
-**Attribution Requirement 署名要求**
-
-If you deploy this app publicly, please: / 如果你将该应用公开部署，请：
-
-1. **Keep the original algorithm credits**: Visibly link back to the [HRT-Recorder-PKcomponent-Test](https://github.com/LaoZhong-Mihari/HRT-Recorder-PKcomponent-Test) repository.
-
-   **保留原始算法的鸣谢信息**：在显眼位置添加指向 [HRT-Recorder-PKcomponent-Test](https://github.com/LaoZhong-Mihari/HRT-Recorder-PKcomponent-Test) 仓库的链接。
-
-2. **Respect the license**: Ensure you follow any licensing terms associated with the original algorithm code.
-
-   **遵守许可协议**：确保你遵循原始算法代码所适用的全部许可条款。
-
----
-
-I wish you a smooth transition and Happy Estimating! 🏳️‍⚧️
-
-祝你性转顺利，快乐估测(>^ω^<)
-
-同时，祝所有用此 webapp 的停经期女性身体健康 ❤️
-At the same time, I wish good health to all the women using this web app who are going through menopause. ❤️
-
----
-
-## TODO
-
-
-
----
-
-## License 许可
-
-本项目遵守 MIT License。See [LICENSE](./LICENSE) for details.
+MIT. See [LICENSE](./LICENSE).

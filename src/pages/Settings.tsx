@@ -20,7 +20,6 @@ interface SettingsProps {
     events: DoseEvent[];
     showDialog: (type: 'alert' | 'confirm', message: string, onConfirm?: () => void) => void;
     setIsDisclaimerOpen: (isOpen: boolean) => void;
-    onNavigateToTransparency: () => void;
     appVersion: string;
     weight: number;
     setIsWeightModalOpen: (isOpen: boolean) => void;
@@ -32,9 +31,6 @@ interface SettingsProps {
     onNavigateToWeight: () => void;
     onNavigateToExport: () => void;
     onNavigateToImport: () => void;
-    autoBackup: boolean;
-    setAutoBackup: (v: boolean) => void;
-    isLoggedIn: boolean;
     devMode: boolean;
     setDevMode: (v: boolean) => void;
     onNavigateToMilkTea: () => void;
@@ -54,10 +50,10 @@ let _savedMobileView: MobileView = 'list';
 
 const Settings: React.FC<SettingsProps> = ({
     t, lang, theme, languageOptions, onClearAllEvents, events,
-    showDialog, setIsDisclaimerOpen, onNavigateToTransparency, appVersion,
+    showDialog, setIsDisclaimerOpen, appVersion,
     weight, pkParams, onNavigateToPKParams, onNavigateToHRTMode,
     onNavigateToLanguage, onNavigateToAppearance, onNavigateToWeight,
-    onNavigateToExport, onNavigateToImport, autoBackup, setAutoBackup, isLoggedIn,
+    onNavigateToExport, onNavigateToImport,
     devMode, setDevMode, onNavigateToMilkTea,
 }) => {
     const { mode } = useHRTMode();
@@ -90,7 +86,7 @@ const Settings: React.FC<SettingsProps> = ({
     const cats: { id: SettingsCat; label: string; Icon: React.ElementType; hint: string }[] = [
         { id: 'general', label: t('settings.group.general'), Icon: Settings2, hint: [t('settings.hrt_mode'), t('drawer.lang'), t('settings.theme')].join(' · ') },
         { id: 'data',    label: t('settings.group.data'),    Icon: Database,  hint: [t('export.title'), t('import.title')].join(' · ') },
-        { id: 'about',   label: t('settings.group.about'),   Icon: Info,      hint: [t('drawer.model_title'), t('transparency.title')].join(' · ') },
+        { id: 'about',   label: t('settings.group.about'),   Icon: Info,      hint: [t('drawer.model_title'), t('drawer.disclaimer')].join(' · ') },
     ];
 
     const catLabel = cats.find(c => c.id === (mobileView === 'list' ? 'general' : mobileView))?.label ?? '';
@@ -129,23 +125,6 @@ const Settings: React.FC<SettingsProps> = ({
                     <ChevronRight size={15} />
                 </span>
             </button>
-
-            {isLoggedIn && (
-                <div className={`${rowBase} cursor-default`}>
-                    <div>
-                        <p className={rowLabel}>{t('settings.auto_backup')}</p>
-                        <p className={`text-xs ${muted} mt-0.5`}>{t('settings.auto_backup_desc')}</p>
-                    </div>
-                    <button
-                        onClick={() => setAutoBackup(!autoBackup)}
-                        className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full ${autoBackup ? 'bg-[var(--color-m3-primary)]' : 'bg-[var(--color-m3-outline-variant)] dark:bg-[var(--color-m3-dark-outline-variant)]'}`}
-                        role="switch"
-                        aria-checked={autoBackup}
-                    >
-                        <span className={`inline-block h-4 w-4 rounded-full bg-white shadow ${autoBackup ? 'translate-x-6' : 'translate-x-1'}`} />
-                    </button>
-                </div>
-            )}
 
             <button onClick={() => navTo(onNavigateToPKParams, 'general')} className={`${rowBase} border-b-0`}>
                 <span className={rowLabel}>{t('settings.pk_params')}</span>
@@ -200,11 +179,6 @@ const Settings: React.FC<SettingsProps> = ({
                 className={rowBase}
             >
                 <span className={rowLabel}>{t('drawer.github')}</span>
-                <ChevronRight size={15} className={muted} />
-            </button>
-
-            <button onClick={() => navTo(onNavigateToTransparency, 'about')} className={rowBase}>
-                <span className={rowLabel}>{t('transparency.title')}</span>
                 <ChevronRight size={15} className={muted} />
             </button>
 

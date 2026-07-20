@@ -22,7 +22,7 @@ const LANG_LOCALE: Record<Lang, string> = {
 };
 
 export const LanguageProvider = ({ children }: { children: React.ReactNode }) => {
-    const [lang, setLang] = useState<Lang>(() => (localStorage.getItem('hrt-lang') as Lang) || 'zh');
+    const [lang, setLang] = useState<Lang>(() => (localStorage.getItem('hrt-lang') as Lang) || 'en');
 
     useEffect(() => {
         localStorage.setItem('hrt-lang', lang);
@@ -32,8 +32,8 @@ export const LanguageProvider = ({ children }: { children: React.ReactNode }) =>
     }, [lang]);
 
     const t = (key: string) => {
-        const pack = (TRANSLATIONS as any)[lang] || TRANSLATIONS.zh;
-        return pack[key] ?? TRANSLATIONS.zh[key as keyof typeof TRANSLATIONS.zh] ?? TRANSLATIONS.en[key as keyof typeof TRANSLATIONS.en] ?? key;
+        const pack = (TRANSLATIONS as any)[lang] || TRANSLATIONS.en;
+        return pack[key] ?? TRANSLATIONS.en[key as keyof typeof TRANSLATIONS.en] ?? TRANSLATIONS.zh[key as keyof typeof TRANSLATIONS.zh] ?? key;
     };
 
     return (

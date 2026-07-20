@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect } from 'react';
-import { Home, ListTodo, Settings as SettingsIcon, UserCircle, ShieldCheck } from 'lucide-react';
+import { Home, ListTodo, Settings as SettingsIcon } from 'lucide-react';
 import CalibrationCurveIcon from '../components/CalibrationCurveIcon';
 import { useTranslation } from '../contexts/LanguageContext';
 
-export type ViewKey = 'home' | 'history' | 'lab' | 'lab-calibration' | 'settings' | 'account' | 'admin' | 'sessions' | 'two-factor' | 'change-password' | 'delete-account' | 'edit-profile' | 'edit-avatar' | 'pk-params' | 'settings-hrt-mode' | 'settings-language' | 'settings-appearance' | 'settings-weight' | 'settings-export' | 'settings-import' | 'settings-transparency' | 'settings-milk-tea';
+export type ViewKey = 'home' | 'history' | 'lab' | 'lab-calibration' | 'settings' | 'pk-params' | 'settings-hrt-mode' | 'settings-language' | 'settings-appearance' | 'settings-weight' | 'settings-export' | 'settings-import' | 'settings-milk-tea';
 
-export const useAppNavigation = (user: any) => {
+export const useAppNavigation = () => {
     const { t } = useTranslation();
 
     // --- State ---
@@ -13,7 +13,7 @@ export const useAppNavigation = (user: any) => {
     const [transitionDirection, setTransitionDirection] = useState<'forward' | 'backward'>('forward');
     const mainScrollRef = useRef<HTMLDivElement>(null);
 
-    const viewOrder: ViewKey[] = ['home', 'history', 'lab', 'lab-calibration', 'settings', 'account', 'sessions', 'two-factor', 'change-password', 'delete-account', 'edit-profile', 'edit-avatar', 'pk-params', 'settings-hrt-mode', 'settings-language', 'settings-appearance', 'settings-weight', 'settings-export', 'settings-import', 'settings-transparency', 'settings-milk-tea', 'admin'];
+    const viewOrder: ViewKey[] = ['home', 'history', 'lab', 'lab-calibration', 'settings', 'pk-params', 'settings-hrt-mode', 'settings-language', 'settings-appearance', 'settings-weight', 'settings-export', 'settings-import', 'settings-milk-tea'];
 
     // --- Actions ---
     const handleViewChange = (view: ViewKey) => {
@@ -37,12 +37,7 @@ export const useAppNavigation = (user: any) => {
         { id: 'history', label: t('nav.history'), icon: ListTodo },
         { id: 'lab', label: t('nav.lab'), icon: CalibrationCurveIcon },
         { id: 'settings', label: t('nav.settings'), icon: SettingsIcon },
-        { id: 'account', label: t('nav.account'), icon: UserCircle },
     ];
-
-    if (user?.isAdmin) {
-        navItems.push({ id: 'admin', label: 'Admin', icon: ShieldCheck });
-    }
 
     return {
         currentView,

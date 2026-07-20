@@ -1,22 +1,13 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Activity, Calendar, FlaskConical, Settings as SettingsIcon, UserCircle, ShieldCheck } from 'lucide-react';
 import { useTranslation, LanguageProvider } from './contexts/LanguageContext';
 import { useDialog, DialogProvider } from './contexts/DialogContext';
 import { HRTModeProvider } from './contexts/HRTModeContext';
 import ErrorBoundary from './components/ErrorBoundary';
-import { APP_VERSION, AppTheme } from './constants';
-import { DoseEvent, LabResult, decompressData, encryptData, decryptData, encryptCloudPayload } from '../logic';
-import { parseCloudBackup } from './utils/cloudBackup';
-import { DoseTemplate } from './components/DoseFormModal';
+import { APP_VERSION, AppTheme, PUBLIC_HOST } from './constants';
+import { DoseEvent, LabResult, decompressData, encryptData, decryptData } from '../logic';
 import { useAppData } from './hooks/useAppData';
 import { useAppNavigation, ViewKey } from './hooks/useAppNavigation';
-
-// Define NavItem interface to match what useAppNavigation returns
-interface NavItem {
-    id: string;
-    label: string;
-    icon: React.ElementType; // Use ElementType to accept components like Lucide icons
-}
+import { loadState, saveState, StateConflictError } from './services/state';
 
 import WeightEditorModal from './components/WeightEditorModal';
 import DoseFormModal from './components/DoseFormModal';
@@ -26,11 +17,6 @@ import Sidebar from './components/Sidebar';
 import PasswordInputModal from './components/PasswordInputModal';
 import DisclaimerModal from './components/DisclaimerModal';
 import LabResultModal from './components/LabResultModal';
-import AuthModal from './components/AuthModal';
-import { AuthProvider, useAuth } from './contexts/AuthContext';
-import ReloadPrompt from './components/ReloadPrompt';
-import BackupConflictModal from './components/BackupConflictModal';
-import { cloudService } from './services/cloud';
 
 // Pages
 import Home from './pages/Home';
@@ -38,14 +24,6 @@ import History from './pages/History';
 import Lab from './pages/Lab';
 import CalibrationSettings from './pages/CalibrationSettings';
 import Settings from './pages/Settings';
-import Account from './pages/Account';
-import Admin from './pages/Admin';
-import SessionsPage from './pages/Sessions';
-import TwoFactorPage from './pages/TwoFactor';
-import ChangePasswordPage from './pages/ChangePassword';
-import DeleteAccountPage from './pages/DeleteAccount';
-import EditProfilePage from './pages/EditProfile';
-import EditAvatarPage from './pages/EditAvatar';
 import PKParamsPage from './pages/PKParams';
 import HRTModeSettings from './pages/HRTModeSettings';
 import LanguageSettings from './pages/LanguageSettings';
@@ -53,23 +31,22 @@ import AppearanceSettings from './pages/AppearanceSettings';
 import WeightSettings from './pages/WeightSettings';
 import ExportSettings from './pages/ExportSettings';
 import ImportSettings from './pages/ImportSettings';
-import TransparencySettings from './pages/TransparencySettings';
 import MilkTeaEasterEgg from './pages/MilkTeaEasterEgg';
+import PublicDashboard from './pages/PublicDashboard';
 
-// Encrypt the export payload for cloud storage when a device key is present.
-// Without a key (e.g. a session predating E2EE, or a passwordless passkey
-// login on a fresh device) the payload is stored as-is.
-async function prepareCloudPayload(exportData: any): Promise<any> {
-    const key = localStorage.getItem('enc_key');
-    if (!key) return exportData;
-    return await encryptCloudPayload(JSON.stringify(exportData), key);
-}
+const hasMeaningfulLocalState = (payload: any): boolean => {
+    const modes = payload?.modes;
+    const hasModeData = modes && ['transfem', 'transmasc'].some(mode => {
+        const block = modes[mode];
+        return ['events', 'labResults', 'doseTemplates', 'quickDoses']
+            .some(key => Array.isArray(block?.[key]) && block[key].length > 0);
+    });
+    return Boolean(hasModeData || payload?.pkParams || (typeof payload?.weight === 'number' && payload.weight !== 70));
+};
 
 const AppContent = () => {
     const { t, lang, setLang } = useTranslation();
     const { showDialog } = useDialog();
-    const { user, token, logout, needsSetup2FA, clearSetup2FA } = useAuth();
-    const [twoFAEnabled, setTwoFAEnabled] = useState(false);
 
     // Use Custom Hooks
     const {
@@ -93,10 +70,12 @@ const AppContent = () => {
         addTemplate, deleteTemplate,
         addQuickDose, deleteQuickDose,
         quickDoses,
-        pkParams, setPkParams, clearPkParams, resetPkParams,
+        pkParams, setPkParams, clearPkParams,
         processImportedData,
-        mergeImportedData,
-        buildExportPayload
+        buildExportPayload,
+        buildServerPayload,
+        stateSignature,
+        hydrateFromServer,
     } = useAppData(showDialog);
 
     const {
@@ -105,8 +84,7 @@ const AppContent = () => {
         handleViewChange,
         mainScrollRef,
         navItems,
-    } = useAppNavigation(user);
-
+    } = useAppNavigation();
 
     // --- Local UI State (Modals & Forms) ---
     const [isWeightModalOpen, setIsWeightModalOpen] = useState(false);
@@ -117,16 +95,10 @@ const AppContent = () => {
     const [isPasswordInputOpen, setIsPasswordInputOpen] = useState(false);
     const [isQuickAddOpen, setIsQuickAddOpen] = useState(false);
     const [isQuickAddLabOpen, setIsQuickAddLabOpen] = useState(false);
-    const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
     const [isDisclaimerOpen, setIsDisclaimerOpen] = useState(false);
     const [isLabModalOpen, setIsLabModalOpen] = useState(false);
     const [editingLab, setEditingLab] = useState<LabResult | null>(null);
     const [pendingImportText, setPendingImportText] = useState<string | null>(null);
-
-    // --- Auto-backup state ---
-    const [autoBackup, setAutoBackup] = useState<boolean>(() =>
-        localStorage.getItem('app-auto-backup') !== 'false'
-    );
 
     // --- Developer mode (unlocks the milk tea easter egg) ---
     const [devMode, setDevMode] = useState<boolean>(() =>
@@ -135,118 +107,164 @@ const AppContent = () => {
     useEffect(() => {
         localStorage.setItem('app-dev-mode', String(devMode));
     }, [devMode]);
-    const autoBackupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const initialLoadRef = useRef(true);
-    const tokenRef = useRef(token);
-    const userRef = useRef(user);
-    const autoBackupRef = useRef(autoBackup);
-    useEffect(() => { tokenRef.current = token; }, [token]);
-    useEffect(() => { userRef.current = user; }, [user]);
-    useEffect(() => { autoBackupRef.current = autoBackup; }, [autoBackup]);
-
-    // --- Startup conflict check state ---
-    const [conflictState, setConflictState] = useState<{
-        cloudNewCount: number;
-        localNewCount: number;
-        cloudParsed: any;
-    } | null>(null);
-    const conflictCheckedRef = useRef(false);
-
 
     const [theme, setTheme] = useState<AppTheme>(() => {
         const saved = localStorage.getItem('app-theme');
         return (saved as AppTheme) || 'system';
     });
 
+    // --- Server sync: the server is the single source of truth ---------------
+    // hrt.silky.moe sits behind Cloudflare Access, so these requests are already
+    // authenticated at the edge — no in-app login. localStorage is a fast local
+    // cache; the D1-backed /api/state is authoritative across devices.
+    const hydratedRef = useRef(false);
+    const lastSyncedSigRef = useRef<string | null>(null);
+    const lastServerUpdateRef = useRef(0);
+    const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const saveInFlightRef = useRef(false);
+    const saveAgainRef = useRef(false);
+    const syncNowRef = useRef<() => Promise<void>>(async () => {});
 
-    useEffect(() => {
-        localStorage.setItem('app-auto-backup', String(autoBackup));
-    }, [autoBackup]);
+    const scheduleRetry = () => {
+        if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = setTimeout(() => syncNowRef.current(), 15000);
+    };
 
-    // --- Auto-backup: debounced save when data changes ---
-    // Deliberately depends ONLY on data slices, not on user/token/autoBackup.
-    // Including those would trigger an unwanted backup on login (potentially
-    // overwriting cloud data with empty local state) or when toggling the
-    // setting. We read current auth/toggle state via refs at fire time.
-    useEffect(() => {
-        if (initialLoadRef.current) {
-            initialLoadRef.current = false;
+    // Focus/online listeners call through this ref so they always see the
+    // current data instead of values captured on the first render.
+    syncNowRef.current = async () => {
+        if (!hydratedRef.current) return;
+        const sig = stateSignature();
+        if (sig === lastSyncedSigRef.current) return;
+        if (saveInFlightRef.current) {
+            saveAgainRef.current = true;
             return;
         }
-        if (autoBackupTimerRef.current) clearTimeout(autoBackupTimerRef.current);
-        autoBackupTimerRef.current = setTimeout(async () => {
-            if (!autoBackupRef.current) return;
-            const currentToken = tokenRef.current;
-            const currentUser = userRef.current;
-            if (!currentToken || !currentUser) return;
-            try {
-                const exportData = buildExportPayload();
-                const payload = await prepareCloudPayload(exportData);
-                await cloudService.save(currentToken, payload);
-                // Silent success — no blocking dialog for background auto-backup
-            } catch {
-                // silent fail for auto-backup
+
+        saveInFlightRef.current = true;
+        try {
+            const payload = buildServerPayload();
+            const sentSig = stateSignature();
+            const result = await saveState(payload);
+            lastSyncedSigRef.current = sentSig;
+            lastServerUpdateRef.current = result.updated_at;
+            if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+        } catch {
+            // Keep the local cache intact and retry even when no later edit
+            // occurs to trigger the debounce again.
+            scheduleRetry();
+        } finally {
+            saveInFlightRef.current = false;
+            if (saveAgainRef.current) {
+                saveAgainRef.current = false;
+                setTimeout(() => syncNowRef.current(), 0);
             }
-        }, 3000);
+        }
+    };
+
+    // Initial load: pull server state and adopt it, or seed the server from
+    // whatever is stored locally on first run.
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const { data, updated_at } = await loadState();
+                if (cancelled) return;
+                if (data && typeof data === 'object' && data.modes) {
+                    hydrateFromServer(data);
+                    lastSyncedSigRef.current = stateSignature();
+                    lastServerUpdateRef.current = updated_at;
+                } else {
+                    const payload = buildServerPayload();
+                    if (hasMeaningfulLocalState(payload)) {
+                        try {
+                            // Only one device may claim an empty server. If two
+                            // first loads race, the winner becomes authoritative.
+                            const result = await saveState(payload, 0);
+                            lastSyncedSigRef.current = stateSignature();
+                            lastServerUpdateRef.current = result.updated_at;
+                        } catch (error) {
+                            if (error instanceof StateConflictError && error.current.data?.modes) {
+                                hydrateFromServer(error.current.data);
+                                lastSyncedSigRef.current = stateSignature();
+                                lastServerUpdateRef.current = error.current.updated_at;
+                            } else {
+                                throw error;
+                            }
+                        }
+                    } else {
+                        // Do not let a fresh device create an empty authoritative
+                        // row before the browser holding the real history opens.
+                        lastSyncedSigRef.current = stateSignature();
+                        lastServerUpdateRef.current = 0;
+                    }
+                }
+            } catch {
+                // Keep localStorage as the working cache and mark it dirty so it
+                // will be retried after connectivity returns.
+                lastSyncedSigRef.current = null;
+            } finally {
+                if (!cancelled) {
+                    hydratedRef.current = true;
+                    if (lastSyncedSigRef.current === null) scheduleRetry();
+                }
+            }
+        })();
+        return () => { cancelled = true; };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Debounced push to the server whenever the syncable data changes.
+    useEffect(() => {
+        if (!hydratedRef.current) return;
+        const sig = stateSignature();
+        if (sig === lastSyncedSigRef.current) return;
+        if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = setTimeout(() => syncNowRef.current(), 1200);
+        return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [events, labResults, doseTemplates, quickDoses, weight, pkParams, calibrationMethod, calibrationHistoryMode]);
+
+    // Refresh from the server when the tab regains focus, so a change made on
+    // another device shows up here — but only when there are no un-synced local
+    // edits, so we never clobber pending changes.
+    useEffect(() => {
+        const refresh = async () => {
+            if (!hydratedRef.current) return;
+            if (stateSignature() !== lastSyncedSigRef.current) {
+                await syncNowRef.current();
+                return;
+            }
+            try {
+                const { data, updated_at } = await loadState();
+                if (data && typeof data === 'object' && data.modes) {
+                    if (updated_at === lastServerUpdateRef.current) return;
+                    hydrateFromServer(data);
+                    lastSyncedSigRef.current = stateSignature();
+                    lastServerUpdateRef.current = updated_at;
+                }
+            } catch { /* ignore */ }
+        };
+        const onVis = () => { if (!document.hidden) refresh(); };
+        const onOnline = () => syncNowRef.current();
+        window.addEventListener('focus', refresh);
+        window.addEventListener('online', onOnline);
+        document.addEventListener('visibilitychange', onVis);
         return () => {
-            if (autoBackupTimerRef.current) clearTimeout(autoBackupTimerRef.current);
+            window.removeEventListener('focus', refresh);
+            window.removeEventListener('online', onOnline);
+            document.removeEventListener('visibilitychange', onVis);
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [events, labResults, doseTemplates]);
+    }, []);
 
-    // --- Startup conflict check when user logs in ---
-    useEffect(() => {
-        if (!user || !token) {
-            conflictCheckedRef.current = false;
-            setConflictState(null); // Clear any lingering modal data from previous session
-            return;
-        }
-        if (conflictCheckedRef.current) return;
-        conflictCheckedRef.current = true;
-
-        cloudService.load(token).then(async list => {
-            if (!list || list.length === 0) return;
-            const latest = list[0];
-            let cloudParsed: any;
-            try {
-                cloudParsed = await parseCloudBackup(latest.data);
-            } catch {
-                return; // Corrupt backup data — skip conflict check
-            }
-            if (!cloudParsed) return; // Encrypted but undecryptable on this device — skip
-
-            const localPayload = buildExportPayload();
-            const localIds = new Set<string>([
-                ...localPayload.modes.transfem.events.map((e: any) => e.id),
-                ...localPayload.modes.transmasc.events.map((e: any) => e.id),
-                ...localPayload.modes.transfem.labResults.map((e: any) => e.id),
-                ...localPayload.modes.transmasc.labResults.map((e: any) => e.id),
-            ]);
-
-            const cloudEvents = [
-                ...(cloudParsed?.modes?.transfem?.events ?? cloudParsed?.events ?? []),
-                ...(cloudParsed?.modes?.transmasc?.events ?? []),
-                ...(cloudParsed?.modes?.transfem?.labResults ?? cloudParsed?.labResults ?? []),
-                ...(cloudParsed?.modes?.transmasc?.labResults ?? []),
-            ];
-            const cloudIds = new Set<string>(cloudEvents.map((e: any) => e.id));
-
-            const cloudNewCount = cloudEvents.filter((e: any) => !localIds.has(e.id)).length;
-            const localNewCount = [...localIds].filter(id => !cloudIds.has(id)).length;
-
-            if (cloudNewCount > 0 || localNewCount > 0) {
-                setConflictState({ cloudNewCount, localNewCount, cloudParsed });
-            }
-        }).catch(() => {});
-    }, [user, token]);
+    useEffect(() => () => {
+        if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+        if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    }, []);
 
     // --- Theme Effect ---
-    useEffect(() => {
-        if (needsSetup2FA && user && currentView !== 'two-factor') {
-            handleViewChange('two-factor');
-        }
-    }, [needsSetup2FA, user]);
-
     useEffect(() => {
         localStorage.setItem('app-theme', theme);
         const root = window.document.documentElement;
@@ -280,15 +298,12 @@ const AppContent = () => {
         { value: 'tr', label: 'Türkçe' },
     ]), []);
 
-
     // --- Modal Logic Wrappers ---
-
     useEffect(() => {
         const shouldLock = isExportModalOpen || isPasswordInputOpen || isWeightModalOpen || isFormOpen || isImportModalOpen || isDisclaimerOpen || isLabModalOpen;
         document.body.style.overflow = shouldLock ? 'hidden' : '';
         return () => { document.body.style.overflow = ''; };
     }, [isExportModalOpen, isPasswordInputOpen, isWeightModalOpen, isFormOpen, isImportModalOpen, isDisclaimerOpen, isLabModalOpen]);
-
 
     const importEventsFromJson = async (text: string): Promise<boolean> => {
         try {
@@ -321,7 +336,6 @@ const AppContent = () => {
         if (decrypted) {
             try {
                 let parsed = JSON.parse(decrypted);
-                // Handle Compression after decryption
                 if (parsed.c && typeof parsed.c === 'string') {
                     const decompressed = await decompressData(parsed.c);
                     parsed = JSON.parse(decompressed);
@@ -338,20 +352,9 @@ const AppContent = () => {
         }
     };
 
-    const handleAddEvent = () => { setEditingEvent(null); setIsFormOpen(true); };
     const handleEditEvent = (e: DoseEvent) => { setEditingEvent(e); setIsFormOpen(true); };
-
     const handleAddLabResult = () => { setEditingLab(null); setIsLabModalOpen(true); };
     const handleEditLabResult = (res: LabResult) => { setEditingLab(res); setIsLabModalOpen(true); };
-
-
-    const handleSaveDosages = () => {
-        if (events.length === 0 && labResults.length === 0) {
-            showDialog('alert', t('drawer.empty_export'));
-            return;
-        }
-        setIsExportModalOpen(true);
-    };
 
     const handleQuickExport = () => {
         if (events.length === 0 && labResults.length === 0) {
@@ -394,77 +397,29 @@ const AppContent = () => {
         return null;
     };
 
-    const handleCloudSave = async () => {
-        if (!token) { setIsAuthModalOpen(true); return; }
-        const exportData = buildExportPayload();
-        try {
-            const payload = await prepareCloudPayload(exportData);
-            await cloudService.save(token, payload);
-            showDialog('alert', t('account.cloud_save_success'));
-        } catch (e) {
-            showDialog('alert', t('account.cloud_save_failed'));
-        }
-    };
-
-    const handleCloudLoad = async (backupId?: string) => {
-        if (!token) { setIsAuthModalOpen(true); return; }
-        try {
-            let parsed: any;
-            let timestamp: number;
-            if (backupId) {
-                const backup = await cloudService.loadOne(token, backupId);
-                parsed = await parseCloudBackup(backup.data);
-                timestamp = backup.created_at;
-            } else {
-                const list = await cloudService.load(token);
-                if (!list || list.length === 0) {
-                    showDialog('alert', t('account.no_cloud_backups'));
-                    return;
-                }
-                const latest = list[0];
-                parsed = await parseCloudBackup(latest.data);
-                timestamp = latest.created_at;
-            }
-            if (!parsed) {
-                showDialog('alert', t('account.cloud_load_failed'));
-                return;
-            }
-            showDialog('confirm', (t('account.load_confirm') as string).replace('{time}', new Date(timestamp * 1000).toLocaleString()), () => {
-                processImportedData(parsed);
-            });
-        } catch (e) {
-            showDialog('alert', t('account.cloud_load_failed'));
-        }
-    };
-
-    const handleCloudMerge = async (backupId: string) => {
-        if (!token) { setIsAuthModalOpen(true); return; }
-        try {
-            const backup = await cloudService.loadOne(token, backupId);
-            const parsed = await parseCloudBackup(backup.data);
-            if (!parsed) {
-                showDialog('alert', t('account.merge_cloud_failed'));
-                return;
-            }
-            mergeImportedData(parsed);
-        } catch (e) {
-            showDialog('alert', t('account.merge_cloud_failed'));
-        }
-    };
-
-    // Construct Nav Items again just for Sidebar prop, or reuse from hook if we exported it
-    // Actually we exported navItems from useAppNavigation
-    // But we need to pass them to sidebar. 
-    // And also reconstruct the bottom nav bar manually because it was inline in the original App.tsx
-    // Let's grab navItems logic from hook or just reconstruct here?
-    // The hook provides navItems.
+    // Sub-views map to a primary tab for the mobile bottom nav highlight.
+    const activeTab = ({
+        'home': 'home',
+        'history': 'history',
+        'lab': 'lab',
+        'lab-calibration': 'lab',
+        'settings': 'settings',
+        'settings-hrt-mode': 'settings',
+        'settings-language': 'settings',
+        'settings-appearance': 'settings',
+        'settings-weight': 'settings',
+        'settings-export': 'settings',
+        'settings-import': 'settings',
+        'settings-milk-tea': 'settings',
+        'pk-params': 'settings',
+    } as Record<string, string>)[currentView] ?? currentView;
 
     return (
         <div className="h-[100dvh] w-full bg-[var(--color-m3-surface)] dark:bg-[var(--color-m3-dark-surface)] flex flex-col md:flex-row font-sans text-[var(--color-m3-on-surface)] dark:text-[var(--color-m3-dark-on-surface)] select-none overflow-hidden">
             <Sidebar
                 navItems={navItems}
                 currentView={currentView}
-                onViewChange={(v) => !needsSetup2FA && handleViewChange(v)}
+                onViewChange={(v) => handleViewChange(v)}
             />
             <div className="flex-1 flex flex-col overflow-hidden w-full bg-[var(--color-m3-surface-dim)] dark:bg-[var(--color-m3-dark-surface)] relative">
 
@@ -569,7 +524,6 @@ const AppContent = () => {
                             events={events}
                             showDialog={showDialog}
                             setIsDisclaimerOpen={setIsDisclaimerOpen}
-                            onNavigateToTransparency={() => handleViewChange('settings-transparency')}
                             appVersion={APP_VERSION}
                             weight={weight}
                             setIsWeightModalOpen={setIsWeightModalOpen}
@@ -581,9 +535,6 @@ const AppContent = () => {
                             onNavigateToWeight={() => handleViewChange('settings-weight')}
                             onNavigateToExport={() => handleViewChange('settings-export')}
                             onNavigateToImport={() => handleViewChange('settings-import')}
-                            autoBackup={autoBackup}
-                            setAutoBackup={setAutoBackup}
-                            isLoggedIn={!!user}
                             devMode={devMode}
                             setDevMode={setDevMode}
                             onNavigateToMilkTea={() => handleViewChange('settings-milk-tea')}
@@ -591,9 +542,7 @@ const AppContent = () => {
                     )}
 
                     {currentView === 'settings-hrt-mode' && (
-                        <HRTModeSettings
-                            onBack={() => handleViewChange('settings')}
-                        />
+                        <HRTModeSettings onBack={() => handleViewChange('settings')} />
                     )}
 
                     {currentView === 'settings-language' && (
@@ -606,19 +555,11 @@ const AppContent = () => {
                     )}
 
                     {currentView === 'settings-appearance' && (
-                        <AppearanceSettings
-                            theme={theme}
-                            setTheme={setTheme}
-                            onBack={() => handleViewChange('settings')}
-                        />
+                        <AppearanceSettings theme={theme} setTheme={setTheme} onBack={() => handleViewChange('settings')} />
                     )}
 
                     {currentView === 'settings-weight' && (
-                        <WeightSettings
-                            weight={weight}
-                            onSave={setWeight}
-                            onBack={() => handleViewChange('settings')}
-                        />
+                        <WeightSettings weight={weight} onSave={setWeight} onBack={() => handleViewChange('settings')} />
                     )}
 
                     {currentView === 'settings-export' && (
@@ -633,82 +574,11 @@ const AppContent = () => {
                     )}
 
                     {currentView === 'settings-import' && (
-                        <ImportSettings
-                            onImportJson={importEventsFromJson}
-                            onBack={() => handleViewChange('settings')}
-                        />
-                    )}
-
-                    {currentView === 'account' && (
-                        <Account
-                            t={t}
-                            user={user}
-                            token={token}
-                            onOpenAuth={() => setIsAuthModalOpen(true)}
-                            onLogout={logout}
-                            onCloudSave={handleCloudSave}
-                            onCloudLoad={handleCloudLoad}
-                            onCloudMerge={handleCloudMerge}
-                            localData={{ events, labResults, doseTemplates, weight }}
-                            onNavigate={(v) => handleViewChange(v as ViewKey)}
-                            twoFAEnabled={twoFAEnabled}
-                            onTwoFAStatusChange={setTwoFAEnabled}
-                        />
-                    )}
-
-                    {currentView === 'sessions' && token && (
-                        <SessionsPage
-                            token={token}
-                            onBack={() => handleViewChange('account')}
-                        />
-                    )}
-
-                    {currentView === 'two-factor' && token && (
-                        <TwoFactorPage
-                            token={token}
-                            enabled={twoFAEnabled}
-                            onStatusChange={(v) => { setTwoFAEnabled(v); if (v) clearSetup2FA(); }}
-                            onBack={() => handleViewChange('account')}
-                            setupRequired={needsSetup2FA}
-                        />
-                    )}
-
-                    {currentView === 'change-password' && (
-                        <ChangePasswordPage
-                            onBack={() => handleViewChange('account')}
-                        />
-                    )}
-
-                    {currentView === 'delete-account' && (
-                        <DeleteAccountPage
-                            onBack={() => handleViewChange('account')}
-                        />
-                    )}
-
-                    {currentView === 'edit-profile' && (
-                        <EditProfilePage
-                            onBack={() => handleViewChange('account')}
-                        />
-                    )}
-
-                    {currentView === 'edit-avatar' && user && token && (
-                        <EditAvatarPage
-                            username={user.username}
-                            token={token}
-                            onBack={() => handleViewChange('account')}
-                        />
-                    )}
-
-                    {currentView === 'settings-transparency' && (
-                        <TransparencySettings
-                            onBack={() => handleViewChange('settings')}
-                        />
+                        <ImportSettings onImportJson={importEventsFromJson} onBack={() => handleViewChange('settings')} />
                     )}
 
                     {currentView === 'settings-milk-tea' && devMode && (
-                        <MilkTeaEasterEgg
-                            onBack={() => handleViewChange('settings')}
-                        />
+                        <MilkTeaEasterEgg onBack={() => handleViewChange('settings')} />
                     )}
 
                     {currentView === 'pk-params' && (
@@ -719,55 +589,21 @@ const AppContent = () => {
                             onBack={() => handleViewChange('settings')}
                         />
                     )}
-
-                    {currentView === 'admin' && user?.isAdmin && (
-                        <Admin t={t} />
-                    )}
                 </div>
 
                 {/* Bottom Navigation — floating island */}
                 <nav className="fixed left-4 right-4 bottom-[calc(0.75rem+env(safe-area-inset-bottom,0px))] z-40 md:hidden rounded-2xl bg-[var(--color-m3-surface-bright)] dark:bg-[var(--color-m3-dark-surface-container)] border border-[var(--color-m3-outline-variant)] dark:border-[var(--color-m3-dark-outline-variant)] shadow-[var(--shadow-m3-3)]">
                     <div className="flex items-stretch p-1.5 gap-1">
-                        {navItems.filter(item => item.id !== 'admin').map(({ id, icon: Icon, label }) => {
-                            const activeTab = ({
-                                'home': 'home',
-                                'history': 'history',
-                                'lab': 'lab',
-                                'lab-calibration': 'lab',
-                                'settings': 'settings',
-                                'settings-hrt-mode': 'settings',
-                                'settings-language': 'settings',
-                                'settings-appearance': 'settings',
-                                'settings-weight': 'settings',
-                                'settings-export': 'settings',
-                                'settings-import': 'settings',
-                                'settings-transparency': 'settings',
-                                'settings-milk-tea': 'settings',
-                                'pk-params': 'settings',
-                                'account': 'account',
-                                'sessions': 'account',
-                                'two-factor': 'account',
-                                'admin': 'account',
-                            } as Record<string, string>)[currentView] ?? currentView;
+                        {navItems.map(({ id, icon: Icon, label }) => {
                             const isActive = activeTab === id;
-                            const isDisabled = needsSetup2FA && id !== 'two-factor';
                             return (
                                 <button
                                     key={id}
-                                    onClick={() => !isDisabled && handleViewChange(id as ViewKey)}
-                                    disabled={isDisabled}
-                                    className={`flex-1 flex flex-col items-center justify-center gap-1 py-1.5 transition-colors duration-150 motion-reduce:transition-none
-                                        ${isDisabled
-                                            ? 'text-[var(--color-m3-outline)] dark:text-[var(--color-m3-dark-outline)] cursor-not-allowed'
-                                            : isActive
-                                            ? 'text-body'
-                                            : 'text-muted'
-                                        }`}
+                                    onClick={() => handleViewChange(id as ViewKey)}
+                                    className={`flex-1 flex flex-col items-center justify-center gap-1 py-1.5 transition-colors duration-150 motion-reduce:transition-none ${isActive ? 'text-body' : 'text-muted'}`}
                                 >
                                     <Icon size={20} strokeWidth={isActive ? 2 : 1.75} />
-                                    <span className="text-[10px] font-medium">
-                                        {label}
-                                    </span>
+                                    <span className="text-[10px] font-medium">{label}</span>
                                 </button>
                             );
                         })}
@@ -836,40 +672,35 @@ const AppContent = () => {
                 onDelete={deleteLabResult}
                 resultToEdit={editingLab}
             />
-
-            <AuthModal
-                isOpen={isAuthModalOpen}
-                onClose={() => setIsAuthModalOpen(false)}
-            />
-
-            <BackupConflictModal
-                isOpen={!!conflictState}
-                onClose={() => setConflictState(null)}
-                cloudNewCount={conflictState?.cloudNewCount ?? 0}
-                localNewCount={conflictState?.localNewCount ?? 0}
-                onMerge={() => {
-                    if (conflictState?.cloudParsed) {
-                        mergeImportedData(conflictState.cloudParsed);
-                    }
-                }}
-            />
-
-        </div >
+        </div>
     );
 };
 
+// The query flag is a localhost-only preview convenience. Production view
+// selection is host-based, matching the Worker API boundary.
+const isPublicView = typeof window !== 'undefined' && (() => {
+    const host = window.location.hostname;
+    const localPreview = (host === 'localhost' || host === '127.0.0.1') &&
+        new URLSearchParams(window.location.search).has('public');
+    return host === PUBLIC_HOST || localPreview;
+})();
+
 const App = () => (
-    <LanguageProvider>
-        <HRTModeProvider>
-            <DialogProvider>
-                <AuthProvider>
+    isPublicView ? (
+        <ErrorBoundary>
+            <PublicDashboard />
+        </ErrorBoundary>
+    ) : (
+        <LanguageProvider>
+            <HRTModeProvider>
+                <DialogProvider>
                     <ErrorBoundary>
                         <AppContent />
                     </ErrorBoundary>
-                </AuthProvider>
-            </DialogProvider>
-        </HRTModeProvider>
-    </LanguageProvider>
+                </DialogProvider>
+            </HRTModeProvider>
+        </LanguageProvider>
+    )
 );
 
 export default App;

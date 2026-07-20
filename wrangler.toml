@@ -3,24 +3,39 @@ main = "worker.ts"
 compatibility_date = "2025-12-04"
 compatibility_flags = ["nodejs_compat"]
 
+# Disable the *.workers.dev route so the only way to reach this Worker is via the
+# custom domains below — the editor host stays behind Cloudflare Access with no
+# un-proxied bypass.
+workers_dev = false
+
+# Custom domains: editing (Access-protected) + the public read-only dashboard.
+# Adjust zone_name if your Cloudflare zone differs.
+routes = [
+  { pattern = "hrt.silky.moe/*", zone_name = "silky.moe" },
+  { pattern = "e.silky.moe/*", zone_name = "silky.moe" },
+]
+
+# Serve the built SPA. The same bundle is served on both hosts; the client picks
+# the public dashboard vs. the editor by hostname (see src/App.tsx).
 [assets]
 directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# App configuration (public, non-secret).
+[vars]
+APP_HOST = "hrt.silky.moe"
+PUBLIC_HOST = "e.silky.moe"
+# Optional defense-in-depth — verify the Cloudflare Access JWT on state reads and writes.
+# Uncomment and fill in to hard-verify Access at the Worker (else the edge is trusted):
+# ACCESS_TEAM_DOMAIN = "your-team"          # <team> in https://<team>.cloudflareaccess.com
+# ACCESS_AUD = "your-access-application-aud"
 
 [observability]
 enabled = true
 head_sampling_rate = 1
 
-# Required secrets (set via `wrangler secret put <NAME>`):
-#   JWT_SECRET      — random string ≥ 32 chars, used to sign auth tokens
-#   ADMIN_USERNAME  — (optional) username for the built-in admin account
-#   ADMIN_PASSWORD  — (optional) password for the built-in admin account
-
 [[d1_databases]]
 binding = "DB"
 database_name = "hrt-tracker-prod"
 database_id = "7b960a72-e25a-4fbf-9a0f-c967b96cc78e"
-
-[[r2_buckets]]
-binding = "AVATAR_BUCKET"
-bucket_name = "mahiro-contents"
-
