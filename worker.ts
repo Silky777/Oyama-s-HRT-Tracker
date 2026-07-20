@@ -1,21 +1,11 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import {
-  runSimulation,
-  computeCalibration,
-  applyPKOverrides,
-  interpolateConcentration_E2,
-  interpolateConcentration_T,
-  normalizeCalibrationMethod,
-  DoseEvent,
-  LabResult,
-  PKCustomParams,
-} from './logic';
-import {
   renderSocialCardPng,
   SOCIAL_CARD_HEIGHT,
   SOCIAL_CARD_WIDTH,
 } from './src/server/socialCard';
 import {
+  PUBLIC_PROJECTION_CLOCK_SKEW_MS,
   PUBLIC_PROJECTION_MAX_POINTS,
   PUBLIC_PROJECTION_VERSION,
   StoredPublicProjection,
@@ -35,33 +25,10 @@ const DEFAULT_APP_HOST = 'hrt.silky.moe';
 const PUBLIC_DISPLAY_MODE: 'transfem' | 'transmasc' = 'transfem';
 const PUBLIC_WINDOW_DAYS_PAST = 7;
 const PUBLIC_WINDOW_DAYS_FUTURE = 7;
-const PUBLIC_MAX_POINTS = 600;
-const PUBLIC_MAX_LABS = 100;
 const MAX_STATE_BYTES = 1_500_000;
 const HOUR_MS = 3_600_000;
 const SOCIAL_CARD_BUCKET_MS = 5 * 60_000;
 const SOCIAL_CARD_RENDER_VERSION = 1;
-const PUBLIC_HISTORY_HOURS = 730 * 24;
-
-const PUBLIC_ROUTES = new Set(['sublingual', 'injection', 'patchApply', 'patchRemove', 'gel', 'oral']);
-const PUBLIC_ESTERS = new Set(['E2', 'EB', 'EV', 'EC', 'EN', 'EU', 'CPA', 'T', 'TC', 'TE', 'TU']);
-const PUBLIC_EXTRA_KEYS = new Set([
-  'concentrationMGmL',
-  'areaCM2',
-  'releaseRateUGPerDay',
-  'sublingualTheta',
-  'sublingualTier',
-  'gelSite',
-  'patchWearH',
-]);
-const PUBLIC_LAB_UNITS = new Set(['pg/ml', 'pmol/l', 'ng/dl', 'nmol/l']);
-const PUBLIC_PK_KEYS = new Set([
-  'e2_kClear', 'e2_kClearInj',
-  'e2_ff_EB', 'e2_ff_EV', 'e2_ff_EC', 'e2_ff_EN', 'e2_ff_EU',
-  'e2_oral_bio', 'e2_sl_quick', 'e2_sl_casual', 'e2_sl_standard', 'e2_sl_strict',
-  'e2_gel_arm', 'e2_gel_thigh', 'e2_gel_scrotal',
-  't_kClear', 't_kClearInj', 't_ff_TC', 't_ff_TE', 't_ff_TU', 't_gel_F',
-]);
 
 function withSecurityHeaders(response: Response): Response {
   const result = new Response(response.body, response);
@@ -147,15 +114,22 @@ interface PublicPayload {
   updatedAt: number;
 }
 
-function safeStoredPublicProjection(value: unknown): StoredPublicProjection | null {
+function safeStoredPublicProjection(value: unknown, nowMs: number): StoredPublicProjection | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const projection = value as Record<string, unknown>;
+  const projectionKeys = new Set(['version', 'sourceHash', 'generatedAt', 'validUntil', 'mode', 'unit', 'series']);
   if (
+    Object.keys(projection).some(key => !projectionKeys.has(key)) ||
     projection.version !== PUBLIC_PROJECTION_VERSION ||
+    typeof projection.sourceHash !== 'string' ||
+      !new RegExp(`^p${PUBLIC_PROJECTION_VERSION}-[0-9a-f]{16}$`).test(projection.sourceHash) ||
     projection.mode !== 'transfem' ||
     projection.unit !== 'pg/ml' ||
-    typeof projection.generatedAt !== 'number' || !Number.isFinite(projection.generatedAt) ||
-    projection.generatedAt < 0 || projection.generatedAt > 8_640_000_000_000_000 ||
+    typeof projection.generatedAt !== 'number' || !Number.isSafeInteger(projection.generatedAt) ||
+    projection.generatedAt < 0 || projection.generatedAt > nowMs + PUBLIC_PROJECTION_CLOCK_SKEW_MS ||
+    typeof projection.validUntil !== 'number' || !Number.isSafeInteger(projection.validUntil) ||
+    projection.validUntil < nowMs || projection.validUntil < projection.generatedAt ||
+    projection.validUntil > projection.generatedAt + 60 * 24 * HOUR_MS ||
     !Array.isArray(projection.series) ||
     projection.series.length > PUBLIC_PROJECTION_MAX_POINTS
   ) return null;
@@ -166,6 +140,7 @@ function safeStoredPublicProjection(value: unknown): StoredPublicProjection | nu
     if (!valuePoint || typeof valuePoint !== 'object' || Array.isArray(valuePoint)) return null;
     const point = valuePoint as Record<string, unknown>;
     if (
+      Object.keys(point).some(key => key !== 't' && key !== 'v') ||
       typeof point.t !== 'number' || !Number.isFinite(point.t) || !Number.isSafeInteger(point.t) ||
       point.t <= previousTime || point.t < 0 || point.t > 8_640_000_000_000_000 ||
       typeof point.v !== 'number' || !Number.isFinite(point.v) || point.v < 0 || point.v > 1_000_000
@@ -174,9 +149,22 @@ function safeStoredPublicProjection(value: unknown): StoredPublicProjection | nu
     previousTime = point.t;
   }
 
+  if (series.length) {
+    const visiblePastMs = PUBLIC_WINDOW_DAYS_PAST * 24 * HOUR_MS;
+    const visibleFutureMs = PUBLIC_WINDOW_DAYS_FUTURE * 24 * HOUR_MS;
+    const lastTime = series[series.length - 1].t;
+    if (
+      series[0].t > nowMs - visiblePastMs + PUBLIC_PROJECTION_CLOCK_SKEW_MS ||
+      lastTime < nowMs + visibleFutureMs ||
+      projection.validUntil > lastTime - visibleFutureMs + 60_000
+    ) return null;
+  }
+
   return {
     version: PUBLIC_PROJECTION_VERSION,
+    sourceHash: projection.sourceHash,
     generatedAt: projection.generatedAt,
+    validUntil: projection.validUntil,
     mode: 'transfem',
     unit: 'pg/ml',
     series,
@@ -205,12 +193,19 @@ function interpolateProjection(
 
 function payloadFromStoredProjection(
   projection: StoredPublicProjection,
-  updatedAt: number,
   nowMs: number,
 ): PublicPayload {
   const startMs = nowMs - PUBLIC_WINDOW_DAYS_PAST * 24 * HOUR_MS;
   const endMs = nowMs + PUBLIC_WINDOW_DAYS_FUTURE * 24 * HOUR_MS;
-  const series = projection.series.filter(point => point.t >= startMs && point.t <= endMs);
+  const seriesByTime = new Map<number, { t: number; v: number }>();
+  const startValue = interpolateProjection(projection.series, startMs);
+  const endValue = interpolateProjection(projection.series, endMs);
+  if (startValue != null) seriesByTime.set(startMs, { t: startMs, v: round(startValue, 2) });
+  for (const point of projection.series) {
+    if (point.t > startMs && point.t < endMs) seriesByTime.set(point.t, point);
+  }
+  if (endValue != null) seriesByTime.set(endMs, { t: endMs, v: round(endValue, 2) });
+  const series = [...seriesByTime.values()].sort((left, right) => left.t - right.t);
   const current = interpolateProjection(projection.series, nowMs);
   return {
     generatedAt: nowMs,
@@ -218,61 +213,10 @@ function payloadFromStoredProjection(
     unit: 'pg/ml',
     now: current == null || !Number.isFinite(current) ? null : round(current, 1),
     series,
-    updatedAt,
+    // Version public caches from the snapshot itself; a transmasc-only/raw
+    // state save must not churn the public image URL.
+    updatedAt: projection.generatedAt,
   };
-}
-
-function safePublicEvent(value: unknown, startH: number, endH: number): DoseEvent | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const event = value as Record<string, unknown>;
-  if (
-    typeof event.id !== 'string' ||
-    typeof event.route !== 'string' || !PUBLIC_ROUTES.has(event.route) ||
-    typeof event.ester !== 'string' || !PUBLIC_ESTERS.has(event.ester) ||
-    typeof event.timeH !== 'number' || !Number.isFinite(event.timeH) ||
-    event.timeH < startH || event.timeH > endH ||
-    typeof event.doseMG !== 'number' || !Number.isFinite(event.doseMG) ||
-    event.doseMG < 0 || event.doseMG > 1_000_000
-  ) return null;
-
-  const extras: Record<string, number> = {};
-  if (event.extras && typeof event.extras === 'object' && !Array.isArray(event.extras)) {
-    for (const [key, extraValue] of Object.entries(event.extras)) {
-      if (PUBLIC_EXTRA_KEYS.has(key) && typeof extraValue === 'number' && Number.isFinite(extraValue)) {
-        extras[key] = extraValue;
-      }
-    }
-  }
-
-  return { ...event, extras } as unknown as DoseEvent;
-}
-
-function safePublicLab(value: unknown, startH: number, endH: number): LabResult | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const lab = value as Record<string, unknown>;
-  if (
-    typeof lab.id !== 'string' ||
-    typeof lab.timeH !== 'number' || !Number.isFinite(lab.timeH) ||
-    lab.timeH < startH || lab.timeH > endH ||
-    typeof lab.concValue !== 'number' || !Number.isFinite(lab.concValue) || lab.concValue < 0 ||
-    typeof lab.unit !== 'string' || !PUBLIC_LAB_UNITS.has(lab.unit)
-  ) return null;
-  return lab as unknown as LabResult;
-}
-
-function safePublicPkParams(value: unknown): PKCustomParams | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const params: Record<string, number> = {};
-  for (const [key, parameter] of Object.entries(value)) {
-    if (
-      PUBLIC_PK_KEYS.has(key) &&
-      typeof parameter === 'number' && Number.isFinite(parameter) &&
-      parameter >= 0 && parameter <= 1_000
-    ) {
-      params[key] = parameter;
-    }
-  }
-  return params as unknown as PKCustomParams;
 }
 
 const publicRevisionFor = (updatedAt: number, generatedAt: number): string => (
@@ -284,11 +228,17 @@ const publicRevision = (payload: PublicPayload): string => publicRevisionFor(
   payload.generatedAt,
 );
 
-async function latestStateUpdatedAt(env: Env): Promise<number> {
+async function latestPublicProjectionGeneratedAt(env: Env): Promise<number> {
   await ensureStateTables(env);
-  const row = await env.DB.prepare('SELECT updated_at FROM app_state WHERE id = 1')
-    .first<{ updated_at: number }>();
-  return row?.updated_at ?? 0;
+  const row = await env.DB.prepare(
+    `SELECT CASE WHEN json_valid(data)
+       THEN CAST(json_extract(data, '$.publicProjection.generatedAt') AS INTEGER)
+       ELSE NULL END AS projection_at
+     FROM app_state WHERE id = 1`,
+  ).first<{ projection_at: number | null }>();
+  return typeof row?.projection_at === 'number' && Number.isFinite(row.projection_at)
+    ? row.projection_at
+    : 0;
 }
 
 const publicLabels = (payload: PublicPayload) => {
@@ -380,8 +330,6 @@ const socialCardHeaders = (revision: string): Record<string, string> => ({
 
 async function buildPublicPayload(env: Env): Promise<PublicPayload> {
   await ensureStateTables(env);
-  const isTransmasc = PUBLIC_DISPLAY_MODE === 'transmasc';
-  const unit = isTransmasc ? 'ng/dl' : 'pg/ml';
   const nowMs = Date.now();
 
   const row = await env.DB.prepare('SELECT data, updated_at FROM app_state WHERE id = 1')
@@ -389,10 +337,10 @@ async function buildPublicPayload(env: Env): Promise<PublicPayload> {
   const empty: PublicPayload = {
     generatedAt: nowMs,
     mode: PUBLIC_DISPLAY_MODE,
-    unit,
+    unit: 'pg/ml',
     now: null,
     series: [],
-    updatedAt: row?.updated_at ?? 0,
+    updatedAt: 0,
   };
   if (!row?.data) return empty;
 
@@ -402,96 +350,14 @@ async function buildPublicPayload(env: Env): Promise<PublicPayload> {
   // Normal public requests are a bounded D1 read plus interpolation. The
   // authenticated editor computed this already-calibrated curve when it saved,
   // so crawlers never need to rerun the pharmacokinetic model at the edge.
-  const storedProjection = safeStoredPublicProjection(state?.publicProjection);
+  const storedProjection = safeStoredPublicProjection(state?.publicProjection, nowMs);
   if (storedProjection) {
-    return payloadFromStoredProjection(storedProjection, row.updated_at, nowMs);
+    return payloadFromStoredProjection(storedProjection, nowMs);
   }
-
-  const modeState = state?.modes?.[PUBLIC_DISPLAY_MODE] ?? {};
-  const nowH = nowMs / HOUR_MS;
-  const historyStartH = nowH - PUBLIC_HISTORY_HOURS;
-  const projectionEndH = nowH + PUBLIC_WINDOW_DAYS_FUTURE * 24;
-  const events: DoseEvent[] = Array.isArray(modeState.events)
-    ? modeState.events
-        .map((event: unknown) => safePublicEvent(event, historyStartH, projectionEndH))
-        .filter((event: DoseEvent | null): event is DoseEvent => event != null)
-    : [];
-  const labResults: LabResult[] = Array.isArray(modeState.labResults)
-    ? modeState.labResults
-        .map((lab: unknown) => safePublicLab(lab, historyStartH, nowH))
-        .filter((lab: LabResult | null): lab is LabResult => lab != null)
-        .sort((a: LabResult, b: LabResult) => a.timeH - b.timeH)
-        .slice(-PUBLIC_MAX_LABS)
-    : [];
-  const weight = typeof state?.weight === 'number' && Number.isFinite(state.weight) && state.weight > 0 && state.weight <= 1_000
-    ? state.weight
-    : 70;
-  const pkParams = safePublicPkParams(state?.pkParams);
-
-  let simulation: ReturnType<typeof runSimulation>;
-  try {
-    applyPKOverrides(pkParams);
-    simulation = runSimulation(events, weight, PUBLIC_WINDOW_DAYS_FUTURE * 24);
-  } catch {
-    return empty;
-  }
-  if (!simulation?.timeH.length) return empty;
-
-  let calibrationFn: (hour: number) => number = () => 1;
-  if (!isTransmasc) {
-    try {
-      const method = normalizeCalibrationMethod(state?.calibrationMethod);
-      const historyMode = state?.calibrationHistoryMode === 'forward' ? 'forward' : 'retrospective';
-      // Preserve the chosen estimator's amplitude/history behavior, but omit
-      // its 21-simulation personal-clearance grid on this edge request. The
-      // authenticated editor still uses the full fit.
-      const calibration = computeCalibration(
-        simulation,
-        events,
-        weight,
-        labResults,
-        method,
-        historyMode,
-        { fitClearance: false },
-      );
-      if (calibration?.factorFn) calibrationFn = calibration.factorFn;
-    } catch {
-      // A calibration failure should not take down the public dashboard.
-    }
-  }
-
-  const startH = nowH - PUBLIC_WINDOW_DAYS_PAST * 24;
-  const endH = nowH + PUBLIC_WINDOW_DAYS_FUTURE * 24;
-  const points: { t: number; v: number }[] = [];
-
-  for (let index = 0; index < simulation.timeH.length; index++) {
-    const hour = simulation.timeH[index];
-    if (hour < startH || hour > endH) continue;
-    const concentration = isTransmasc
-      ? simulation.concNGdL_T[index]
-      : simulation.concPGmL_E2[index] * calibrationFn(hour);
-    if (!Number.isFinite(concentration)) continue;
-    points.push({ t: Math.round(hour * HOUR_MS), v: round(concentration, 2) });
-  }
-
-  const stride = Math.max(1, Math.ceil(points.length / PUBLIC_MAX_POINTS));
-  const series = stride === 1 ? points : points.filter((_, index) => index % stride === 0);
-  const currentRaw = isTransmasc
-    ? interpolateConcentration_T(simulation, nowH)
-    : (() => {
-        const value = interpolateConcentration_E2(simulation, nowH);
-        return value == null ? null : value * calibrationFn(nowH);
-      })();
-  const now = currentRaw != null && Number.isFinite(currentRaw) ? round(currentRaw, 1) : null;
-
-  return {
-    generatedAt: nowMs,
-    mode: PUBLIC_DISPLAY_MODE,
-    unit,
-    now,
-    series,
-    updatedAt: row.updated_at,
-  };
+  // Missing/legacy/invalid snapshots fail closed. Opening the authenticated
+  // editor backfills one through the normal state sync without exposing raw
+  // events or spending simulation CPU on an unauthenticated request.
+  return empty;
 }
 
 type StateRow = { data: string; updated_at: number };
@@ -568,7 +434,7 @@ export default {
           return text('Method Not Allowed', 405, { Allow: 'GET, HEAD' });
         }
 
-        let revision = publicRevisionFor(await latestStateUpdatedAt(env), Date.now());
+        let revision = publicRevisionFor(await latestPublicProjectionGeneratedAt(env), Date.now());
         let headers = socialCardHeaders(revision);
         if (request.headers.get('If-None-Match') === headers.ETag) {
           return withSecurityHeaders(new Response(null, { status: 304, headers }));

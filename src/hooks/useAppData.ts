@@ -6,6 +6,8 @@ import { useTranslation } from '../contexts/LanguageContext';
 import { useHRTMode } from '../contexts/HRTModeContext';
 import {
     buildStoredPublicProjection,
+    hashPublicProjectionSource,
+    isStoredPublicProjectionReusable,
     PUBLIC_PROJECTION_FUTURE_DAYS,
     StoredPublicProjection,
 } from '../shared/publicProjection';
@@ -15,6 +17,16 @@ const keyFor = (mode: 'transfem' | 'transmasc', suffix: string) =>
     mode === 'transmasc' ? `hrt-masc-${suffix}` : `hrt-${suffix}`;
 
 const PUBLIC_PROJECTION_STORAGE_KEY = 'hrt-public-projection';
+const compareText = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
+
+const stableStringify = (value: unknown): string => {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+    if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+    const entries = Object.entries(value as Record<string, unknown>)
+        .filter(([, entryValue]) => entryValue !== undefined)
+        .sort(([left], [right]) => compareText(left, right));
+    return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableStringify(entryValue)}`).join(',')}}`;
+};
 
 export interface DoseTemplate {
     id: string;
@@ -84,11 +96,15 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
             return parsed;
         } catch { return null; }
     });
-    const [cachedPublicProjection, setCachedPublicProjection] = useState<StoredPublicProjection | null>(() =>
+    const publicProjectionRef = useRef<StoredPublicProjection | null>(
         loadJSON<StoredPublicProjection | null>(PUBLIC_PROJECTION_STORAGE_KEY, null)
     );
 
-    const [simulation, setSimulation] = useState<SimulationResult | null>(null);
+    const [simulationState, setSimulationState] = useState<{
+        value: SimulationResult | null;
+        sourceHash: string;
+    }>({ value: null, sourceHash: '' });
+    const simulation = simulationState.value;
     const [currentTime, setCurrentTime] = useState(new Date());
 
     // --- Effects ---
@@ -166,13 +182,19 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
     }, []);
 
     useEffect(() => {
+        const sourceHash = hashPublicProjectionSource(stableStringify({
+            events: [...events]
+                .sort((left, right) => left.timeH - right.timeH || compareText(left.id, right.id)),
+            weight,
+            pkParams: pkParams ?? null,
+        }));
         if (events.length > 0) {
             // Keep enough future curve in memory to seed a long-lived public
             // snapshot whenever the authenticated editor syncs to D1.
             const res = runSimulation(events, weight, PUBLIC_PROJECTION_FUTURE_DAYS * 24);
-            setSimulation(res);
+            setSimulationState({ value: res, sourceHash });
         } else {
-            setSimulation(null);
+            setSimulationState({ value: null, sourceHash });
         }
     }, [events, weight, pkParams]);
 
@@ -185,18 +207,6 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         return computeCalibration(simulation, events, weight, labResults, calibrationMethod, calibrationHistoryMode);
     }, [simulation, events, weight, labResults, calibrationMethod, calibrationHistoryMode]);
     const calibrationFn = calibration.factorFn;
-
-    const generatedPublicProjection = useMemo<StoredPublicProjection | null>(() => {
-        if (mode !== 'transfem') return null;
-        return buildStoredPublicProjection(simulation, calibrationFn);
-    }, [mode, simulation, calibrationFn]);
-    const publicProjection = generatedPublicProjection ?? cachedPublicProjection;
-
-    useEffect(() => {
-        if (!generatedPublicProjection) return;
-        setCachedPublicProjection(generatedPublicProjection);
-        localStorage.setItem(PUBLIC_PROJECTION_STORAGE_KEY, JSON.stringify(generatedPublicProjection));
-    }, [generatedPublicProjection]);
 
     const currentLevel = useMemo(() => {
         if (!simulation) return 0;
@@ -645,11 +655,9 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
     };
 
     // --- Server sync helpers (single-user, server = source of truth) ---
-    // Build the full canonical blob purely from localStorage (both modes) plus
-    // the shared settings. Reading mode-scoped arrays from localStorage — rather
-    // than in-memory state — keeps the payload consistent even mid mode-switch,
-    // and matches how the localStorage persistence effects have already flushed.
-    const buildServerPayload = () => {
+    // Read canonical raw inputs without deriving volatile data. Keeping this
+    // separate from projection generation makes stateSignature() stable.
+    const readServerInputs = () => {
         const readMode = (m: 'transfem' | 'transmasc') => ({
             events: loadJSON<DoseEvent[]>(keyFor(m, 'events'), []),
             labResults: loadJSON<LabResult[]>(keyFor(m, 'lab-results'), []),
@@ -667,31 +675,135 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         const calH: CalibrationHistoryMode = localStorage.getItem('hrt-cal-history-mode') === 'forward' ? 'forward' : 'retrospective';
         const activeMode = modeRef.current;
         return {
-            meta: { version: 2, exportedAt: new Date().toISOString() },
-            mode: activeMode,
-            weight: Number.isFinite(w) && w > 0 ? w : weightRef.current,
             modes,
-            events: modes[activeMode].events,
-            labResults: modes[activeMode].labResults,
-            doseTemplates: modes[activeMode].doseTemplates,
+            weight: Number.isFinite(w) && w > 0 ? w : weightRef.current,
             pkParams: pk,
             calibrationMethod: calM,
             calibrationHistoryMode: calH,
+            activeMode,
+        };
+    };
+
+    const publicProjectionSource = (inputs: ReturnType<typeof readServerInputs>) => {
+        const events = [...inputs.modes.transfem.events]
+            .sort((left, right) => left.timeH - right.timeH || compareText(left.id, right.id));
+        const labs = [...inputs.modes.transfem.labResults]
+            .sort((left, right) => left.timeH - right.timeH || compareText(left.id, right.id));
+        const serialized = stableStringify({
+            events,
+            labResults: labs,
+            weight: inputs.weight,
+            pkParams: inputs.pkParams ?? null,
+            calibrationMethod: inputs.calibrationMethod,
+            calibrationHistoryMode: inputs.calibrationHistoryMode,
+        });
+        return { events, labs, sourceHash: hashPublicProjectionSource(serialized) };
+    };
+
+    const isPublicProjectionDirty = () => {
+        const inputs = readServerInputs();
+        const { events, sourceHash } = publicProjectionSource(inputs);
+        return !isStoredPublicProjectionReusable(
+            publicProjectionRef.current,
+            sourceHash,
+            Date.now(),
+            events.length > 0,
+        );
+    };
+
+    const ensurePublicProjection = (inputs: ReturnType<typeof readServerInputs>): StoredPublicProjection => {
+        const { events: publicEvents, labs: publicLabs, sourceHash } = publicProjectionSource(inputs);
+        if (isStoredPublicProjectionReusable(
+            publicProjectionRef.current,
+            sourceHash,
+            Date.now(),
+            publicEvents.length > 0,
+        )) {
+            return publicProjectionRef.current;
+        }
+
+        const activeSimulationHash = hashPublicProjectionSource(stableStringify({
+            events: publicEvents,
+            weight: inputs.weight,
+            pkParams: inputs.pkParams ?? null,
+        }));
+        const requiredEndH = Date.now() / 3_600_000 + PUBLIC_PROJECTION_FUTURE_DAYS * 24;
+        const activeHasProjectionHorizon = publicEvents.length === 0
+            ? simulation === null
+            : Boolean(
+                simulation?.timeH.length &&
+                simulation.timeH[simulation.timeH.length - 1] >= requiredEndH - 1
+            );
+        const canReuseActiveFit = modeRef.current === 'transfem' &&
+            simulationState.sourceHash === activeSimulationHash &&
+            activeHasProjectionHorizon &&
+            stableStringify(labResults) === stableStringify(publicLabs) &&
+            calibrationMethod === inputs.calibrationMethod &&
+            calibrationHistoryMode === inputs.calibrationHistoryMode;
+
+        let publicSimulation: SimulationResult | null;
+        let publicCalibrationFn: (timeH: number) => number;
+        if (canReuseActiveFit) {
+            publicSimulation = simulation;
+            publicCalibrationFn = calibrationFn;
+        } else {
+            applyPKOverrides(inputs.pkParams ?? null);
+            publicSimulation = publicEvents.length
+                ? runSimulation(publicEvents, inputs.weight, PUBLIC_PROJECTION_FUTURE_DAYS * 24)
+                : null;
+            const publicCalibration = computeCalibration(
+                publicSimulation,
+                publicEvents,
+                inputs.weight,
+                publicLabs,
+                inputs.calibrationMethod,
+                inputs.calibrationHistoryMode,
+            );
+            publicCalibrationFn = publicCalibration.factorFn;
+        }
+
+        const projection = buildStoredPublicProjection(
+            publicSimulation,
+            publicCalibrationFn,
+            sourceHash,
+        );
+        publicProjectionRef.current = projection;
+        localStorage.setItem(PUBLIC_PROJECTION_STORAGE_KEY, JSON.stringify(projection));
+        return projection;
+    };
+
+    // Build the full canonical blob only for an actual save. Projection work is
+    // cached by a stable transfem source hash and never runs from signature
+    // checks; transmasc-only saves therefore reuse the existing public curve.
+    const buildServerPayload = () => {
+        const inputs = readServerInputs();
+        const publicProjection = ensurePublicProjection(inputs);
+        const activeMode = inputs.activeMode;
+        return {
+            meta: { version: 2, exportedAt: new Date().toISOString() },
+            mode: activeMode,
+            weight: inputs.weight,
+            modes: inputs.modes,
+            events: inputs.modes[activeMode].events,
+            labResults: inputs.modes[activeMode].labResults,
+            doseTemplates: inputs.modes[activeMode].doseTemplates,
+            pkParams: inputs.pkParams,
+            calibrationMethod: inputs.calibrationMethod,
+            calibrationHistoryMode: inputs.calibrationHistoryMode,
             publicProjection,
         };
     };
 
-    // A stable string of the syncable content (excludes the volatile `meta`
-    // timestamp) so change-detection doesn't fire on every render.
+    // Stable raw sync signature. The time-based projection has its own dirty
+    // check and is deliberately excluded.
     const stateSignature = () => {
-        const p = buildServerPayload();
-        return JSON.stringify({
-            modes: p.modes,
-            weight: p.weight,
-            pkParams: p.pkParams ?? null,
-            calibrationMethod: p.calibrationMethod,
-            calibrationHistoryMode: p.calibrationHistoryMode,
-            publicProjection: p.publicProjection,
+        const inputs = readServerInputs();
+        return stableStringify({
+            modes: inputs.modes,
+            weight: inputs.weight,
+            pkParams: inputs.pkParams ?? null,
+            calibrationMethod: inputs.calibrationMethod,
+            calibrationHistoryMode: inputs.calibrationHistoryMode,
         });
     };
 
@@ -748,7 +860,7 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         setPkParamsState(payload.pkParams && typeof payload.pkParams === 'object' ? payload.pkParams : null);
         setCalibrationMethodState(normalizeCalibrationMethod(payload.calibrationMethod));
         setCalibrationHistoryModeState(payload.calibrationHistoryMode === 'forward' ? 'forward' : 'retrospective');
-        setCachedPublicProjection(nextPublicProjection);
+        publicProjectionRef.current = nextPublicProjection;
     };
 
     return {
@@ -781,7 +893,7 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         buildExportPayload,
         buildServerPayload,
         stateSignature,
+        isPublicProjectionDirty,
         hydrateFromServer,
-        publicProjection,
     };
 };

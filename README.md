@@ -12,11 +12,10 @@ is served at `e.silky.moe`.
   offline edits. Failed saves retry when connectivity returns.
 - There is no in-app account, password, session, 2FA, passkey, admin, avatar, or
   multi-user stack. Cloudflare Access protects the editor host.
-- The public API computes the estimated hormone curve inside the Worker. It
-  returns only the current modeled level and curve points, never doses or labs.
-- To stay within edge CPU limits, public EKF/MIPD projections retain their
-  amplitude calibration but omit the private editor's personal-clearance grid.
-  The authenticated editor continues to use the full calibration fit.
+- The authenticated browser saves a bounded, fully calibrated public curve
+  snapshot alongside the private state. Public Worker requests only validate,
+  slice, and interpolate that snapshot, keeping raw doses/labs private and edge
+  CPU usage low.
 - The public HTML includes server-rendered Open Graph metadata, and
   `/api/embed.png` renders the same safe projection as a 600x315 graph card for
   Discord and other link previews.
@@ -112,8 +111,11 @@ deployment. Do not blindly copy an encrypted legacy `content.data` value into
 Sharing `https://e.silky.moe/` produces a snapshot of the modeled current level
 and curve at crawl time. Discord and other services cache unfurls, so an already
 posted preview does not update live. Use **Copy share link** on the public
-dashboard to copy a query-versioned URL when a guaranteed fresh re-scrape is
-needed.
+dashboard to give the receiving service a query-versioned URL to crawl; that
+service ultimately controls its own preview cache. After
+upgrading an older deployment, open the authenticated editor once
+to backfill its first public projection; later edits and near-expiry checks keep
+it refreshed automatically.
 
 ## Docker
 

@@ -75,8 +75,8 @@ const AppContent = () => {
         buildExportPayload,
         buildServerPayload,
         stateSignature,
+        isPublicProjectionDirty,
         hydrateFromServer,
-        publicProjection,
     } = useAppData(showDialog);
 
     const {
@@ -125,6 +125,7 @@ const AppContent = () => {
     const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const saveInFlightRef = useRef(false);
     const saveAgainRef = useRef(false);
+    const projectionSyncPendingRef = useRef(false);
     const syncNowRef = useRef<() => Promise<void>>(async () => {});
 
     const scheduleRetry = () => {
@@ -137,24 +138,63 @@ const AppContent = () => {
     syncNowRef.current = async () => {
         if (!hydratedRef.current) return;
         const sig = stateSignature();
-        if (sig === lastSyncedSigRef.current) return;
+        const rawStateDirty = sig !== lastSyncedSigRef.current;
+        const projectionDirty = isPublicProjectionDirty();
+        if (!rawStateDirty && !projectionDirty && !projectionSyncPendingRef.current) return;
         if (saveInFlightRef.current) {
             saveAgainRef.current = true;
             return;
         }
 
+        // A projection-only refresh carries the entire canonical state blob, so
+        // use compare-and-swap to ensure an idle device cannot overwrite newer
+        // raw edits from another device merely to renew the public curve.
+        const projectionOnly = !rawStateDirty;
+        const baseUpdatedAt = projectionOnly ? lastServerUpdateRef.current : undefined;
+        if (projectionOnly) projectionSyncPendingRef.current = true;
         saveInFlightRef.current = true;
         try {
             const payload = buildServerPayload();
-            const sentSig = stateSignature();
-            const result = await saveState(payload);
-            lastSyncedSigRef.current = sentSig;
+            if (
+                projectionOnly &&
+                baseUpdatedAt === 0 &&
+                !hasMeaningfulLocalState(payload)
+            ) {
+                // Preserve the first-run safeguard below: renewing an empty
+                // public snapshot must not claim an empty D1 row before the
+                // device holding the real, not-yet-uploaded history opens.
+                projectionSyncPendingRef.current = false;
+                return;
+            }
+            const result = await saveState(payload, baseUpdatedAt);
+            lastSyncedSigRef.current = sig;
             lastServerUpdateRef.current = result.updated_at;
+            projectionSyncPendingRef.current = false;
             if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-        } catch {
-            // Keep the local cache intact and retry even when no later edit
-            // occurs to trigger the debounce again.
-            scheduleRetry();
+        } catch (error) {
+            if (
+                projectionOnly &&
+                error instanceof StateConflictError &&
+                error.current.data?.modes &&
+                stateSignature() === sig
+            ) {
+                // No local edit happened while the request was in flight, so
+                // safely adopt the newer server truth. If that row still needs
+                // a projection, the follow-up sync regenerates it from the
+                // newly hydrated inputs.
+                hydrateFromServer(error.current.data);
+                lastSyncedSigRef.current = stateSignature();
+                lastServerUpdateRef.current = error.current.updated_at;
+                projectionSyncPendingRef.current = false;
+                if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+                if (isPublicProjectionDirty()) saveAgainRef.current = true;
+            } else {
+                // Keep a projection-only upload explicitly pending: building
+                // the payload made its local cache clean even though D1 never
+                // accepted it. Raw edits remain dirty via their signature.
+                if (projectionOnly) projectionSyncPendingRef.current = true;
+                scheduleRetry();
+            }
         } finally {
             saveInFlightRef.current = false;
             if (saveAgainRef.current) {
@@ -173,12 +213,11 @@ const AppContent = () => {
                 const { data, updated_at } = await loadState();
                 if (cancelled) return;
                 if (data && typeof data === 'object' && data.modes) {
-                    const needsPublicProjectionBackfill = !data.publicProjection;
                     hydrateFromServer(data);
                     // Older rows predate the safe precomputed public snapshot.
                     // Keep them dirty so the normal debounce writes one after
                     // hydration has rebuilt the calibrated browser simulation.
-                    lastSyncedSigRef.current = needsPublicProjectionBackfill ? null : stateSignature();
+                    lastSyncedSigRef.current = stateSignature();
                     lastServerUpdateRef.current = updated_at;
                 } else {
                     const payload = buildServerPayload();
@@ -191,9 +230,8 @@ const AppContent = () => {
                             lastServerUpdateRef.current = result.updated_at;
                         } catch (error) {
                             if (error instanceof StateConflictError && error.current.data?.modes) {
-                                const needsPublicProjectionBackfill = !error.current.data.publicProjection;
                                 hydrateFromServer(error.current.data);
-                                lastSyncedSigRef.current = needsPublicProjectionBackfill ? null : stateSignature();
+                                lastSyncedSigRef.current = stateSignature();
                                 lastServerUpdateRef.current = error.current.updated_at;
                             } else {
                                 throw error;
@@ -225,12 +263,12 @@ const AppContent = () => {
     useEffect(() => {
         if (!hydratedRef.current) return;
         const sig = stateSignature();
-        if (sig === lastSyncedSigRef.current) return;
+        if (sig === lastSyncedSigRef.current && !isPublicProjectionDirty()) return;
         if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
         saveTimerRef.current = setTimeout(() => syncNowRef.current(), 1200);
         return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [events, labResults, doseTemplates, quickDoses, weight, pkParams, calibrationMethod, calibrationHistoryMode, publicProjection]);
+    }, [events, labResults, doseTemplates, quickDoses, weight, pkParams, calibrationMethod, calibrationHistoryMode]);
 
     // Refresh from the server when the tab regains focus, so a change made on
     // another device shows up here — but only when there are no un-synced local
@@ -238,7 +276,7 @@ const AppContent = () => {
     useEffect(() => {
         const refresh = async () => {
             if (!hydratedRef.current) return;
-            if (stateSignature() !== lastSyncedSigRef.current) {
+            if (stateSignature() !== lastSyncedSigRef.current || isPublicProjectionDirty()) {
                 await syncNowRef.current();
                 return;
             }
@@ -249,6 +287,7 @@ const AppContent = () => {
                     hydrateFromServer(data);
                     lastSyncedSigRef.current = stateSignature();
                     lastServerUpdateRef.current = updated_at;
+                    if (isPublicProjectionDirty()) await syncNowRef.current();
                 }
             } catch { /* ignore */ }
         };
