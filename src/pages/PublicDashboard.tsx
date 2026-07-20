@@ -1,4 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Check, Link2 } from 'lucide-react';
 import AnimatedNumber from '../components/AnimatedNumber';
 
 // Public, read-only dashboard for e.silky.moe. It shows only the current
@@ -225,7 +226,9 @@ const PublicDashboard: React.FC = () => {
     const dark = useSystemDark();
     const [payload, setPayload] = useState<PublicPayload | null>(null);
     const [status, setStatus] = useState<'loading' | 'ok' | 'error'>('loading');
+    const [linkCopied, setLinkCopied] = useState(false);
     const [, forceTick] = useState(0);
+    const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const fetchPayload = useRef(async () => {
         try {
@@ -246,7 +249,12 @@ const PublicDashboard: React.FC = () => {
         window.addEventListener('focus', onFocus);
         // Re-render every 30s so the "updated N min ago" label stays fresh.
         const clock = setInterval(() => forceTick(x => x + 1), 30000);
-        return () => { clearInterval(poll); clearInterval(clock); window.removeEventListener('focus', onFocus); };
+        return () => {
+            clearInterval(poll);
+            clearInterval(clock);
+            if (copiedTimer.current) clearTimeout(copiedTimer.current);
+            window.removeEventListener('focus', onFocus);
+        };
     }, []);
 
     const isTransmasc = payload?.mode === 'transmasc';
@@ -258,13 +266,47 @@ const PublicDashboard: React.FC = () => {
         document.title = `${title} Dashboard`;
     }, [title]);
 
+    const copyShareLink = async () => {
+        if (!payload) return;
+        // A unique page URL forces chat services to crawl again even if the
+        // bare dashboard URL (or an earlier share) is still in their cache.
+        const revision = `${payload.updatedAt}-${Date.now()}`;
+        const shareUrl = `${window.location.origin}/?share=${encodeURIComponent(revision)}`;
+        try {
+            await navigator.clipboard.writeText(shareUrl);
+        } catch {
+            const textArea = document.createElement('textarea');
+            textArea.value = shareUrl;
+            textArea.style.position = 'fixed';
+            textArea.style.opacity = '0';
+            document.body.appendChild(textArea);
+            textArea.select();
+            document.execCommand('copy');
+            textArea.remove();
+        }
+        setLinkCopied(true);
+        if (copiedTimer.current) clearTimeout(copiedTimer.current);
+        copiedTimer.current = setTimeout(() => setLinkCopied(false), 2000);
+    };
+
     return (
         <div className="min-h-[100dvh] w-full bg-[var(--color-m3-surface)] dark:bg-[var(--color-m3-dark-surface)] text-[var(--color-m3-on-surface)] dark:text-[var(--color-m3-dark-on-surface)] flex flex-col items-center px-5 py-10">
             <div className="w-full max-w-2xl">
-                <header className="mb-8">
+                <header className="mb-8 flex items-center justify-between gap-4">
                     <h1 className="text-sm font-medium tracking-wide text-[var(--color-m3-on-surface-variant)] dark:text-[var(--color-m3-dark-on-surface-variant)] uppercase">
                         Current {title}
                     </h1>
+                    {payload && (
+                        <button
+                            type="button"
+                            onClick={copyShareLink}
+                            className="inline-flex items-center gap-2 rounded-full px-3 py-2 text-xs font-medium text-[var(--color-m3-primary)] dark:text-[var(--color-m3-dark-primary)] hover:bg-[var(--color-m3-surface-container)] dark:hover:bg-[var(--color-m3-dark-surface-container-high)] transition-colors"
+                            title="Copy a link with a fresh social preview"
+                        >
+                            {linkCopied ? <Check size={15} aria-hidden="true" /> : <Link2 size={15} aria-hidden="true" />}
+                            {linkCopied ? 'Copied' : 'Copy share link'}
+                        </button>
+                    )}
                 </header>
 
                 {status === 'error' && !payload && (

@@ -4,10 +4,17 @@ import { DoseEvent, Route, Ester, SimulationResult, runSimulation, interpolateCo
 import { formatDate } from '../utils/helpers';
 import { useTranslation } from '../contexts/LanguageContext';
 import { useHRTMode } from '../contexts/HRTModeContext';
+import {
+    buildStoredPublicProjection,
+    PUBLIC_PROJECTION_FUTURE_DAYS,
+    StoredPublicProjection,
+} from '../shared/publicProjection';
 
 // Storage key prefix per HRT mode — keeps transfem and transmasc data independent.
 const keyFor = (mode: 'transfem' | 'transmasc', suffix: string) =>
     mode === 'transmasc' ? `hrt-masc-${suffix}` : `hrt-${suffix}`;
+
+const PUBLIC_PROJECTION_STORAGE_KEY = 'hrt-public-projection';
 
 export interface DoseTemplate {
     id: string;
@@ -77,6 +84,9 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
             return parsed;
         } catch { return null; }
     });
+    const [cachedPublicProjection, setCachedPublicProjection] = useState<StoredPublicProjection | null>(() =>
+        loadJSON<StoredPublicProjection | null>(PUBLIC_PROJECTION_STORAGE_KEY, null)
+    );
 
     const [simulation, setSimulation] = useState<SimulationResult | null>(null);
     const [currentTime, setCurrentTime] = useState(new Date());
@@ -157,12 +167,14 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
 
     useEffect(() => {
         if (events.length > 0) {
-            const res = runSimulation(events, weight);
+            // Keep enough future curve in memory to seed a long-lived public
+            // snapshot whenever the authenticated editor syncs to D1.
+            const res = runSimulation(events, weight, PUBLIC_PROJECTION_FUTURE_DAYS * 24);
             setSimulation(res);
         } else {
             setSimulation(null);
         }
-    }, [events, weight]);
+    }, [events, weight, pkParams]);
 
     // --- Derived State ---
     // Self-learning calibration: fits a personal amplitude (+ clearance, for the
@@ -173,6 +185,18 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         return computeCalibration(simulation, events, weight, labResults, calibrationMethod, calibrationHistoryMode);
     }, [simulation, events, weight, labResults, calibrationMethod, calibrationHistoryMode]);
     const calibrationFn = calibration.factorFn;
+
+    const generatedPublicProjection = useMemo<StoredPublicProjection | null>(() => {
+        if (mode !== 'transfem') return null;
+        return buildStoredPublicProjection(simulation, calibrationFn);
+    }, [mode, simulation, calibrationFn]);
+    const publicProjection = generatedPublicProjection ?? cachedPublicProjection;
+
+    useEffect(() => {
+        if (!generatedPublicProjection) return;
+        setCachedPublicProjection(generatedPublicProjection);
+        localStorage.setItem(PUBLIC_PROJECTION_STORAGE_KEY, JSON.stringify(generatedPublicProjection));
+    }, [generatedPublicProjection]);
 
     const currentLevel = useMemo(() => {
         if (!simulation) return 0;
@@ -653,6 +677,7 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
             pkParams: pk,
             calibrationMethod: calM,
             calibrationHistoryMode: calH,
+            publicProjection,
         };
     };
 
@@ -666,6 +691,7 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
             pkParams: p.pkParams ?? null,
             calibrationMethod: p.calibrationMethod,
             calibrationHistoryMode: p.calibrationHistoryMode,
+            publicProjection: p.publicProjection,
         });
     };
 
@@ -705,6 +731,14 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         if (payload.calibrationHistoryMode === 'forward' || payload.calibrationHistoryMode === 'retrospective') {
             localStorage.setItem('hrt-cal-history-mode', payload.calibrationHistoryMode);
         }
+        const nextPublicProjection = payload.publicProjection && typeof payload.publicProjection === 'object'
+            ? payload.publicProjection as StoredPublicProjection
+            : null;
+        if (nextPublicProjection) {
+            localStorage.setItem(PUBLIC_PROJECTION_STORAGE_KEY, JSON.stringify(nextPublicProjection));
+        } else {
+            localStorage.removeItem(PUBLIC_PROJECTION_STORAGE_KEY);
+        }
 
         setEvents(active.evs);
         setLabResults(active.ls);
@@ -714,6 +748,7 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         setPkParamsState(payload.pkParams && typeof payload.pkParams === 'object' ? payload.pkParams : null);
         setCalibrationMethodState(normalizeCalibrationMethod(payload.calibrationMethod));
         setCalibrationHistoryModeState(payload.calibrationHistoryMode === 'forward' ? 'forward' : 'retrospective');
+        setCachedPublicProjection(nextPublicProjection);
     };
 
     return {
@@ -746,6 +781,7 @@ export const useAppData = (showDialog: (type: 'alert' | 'confirm', message: stri
         buildExportPayload,
         buildServerPayload,
         stateSignature,
-        hydrateFromServer
+        hydrateFromServer,
+        publicProjection,
     };
 };

@@ -10,7 +10,9 @@ custom-host Access policy.
 `e.silky.moe` is intentionally public. The Worker returns 404 for `/api/state`
 on that host. `/api/public` contains only a modeled current level, unit, mode,
 timestamps, and curve points. Raw doses, labs, templates, settings, and D1
-history are not included.
+history are not included. `/api/embed.png` turns that same limited projection
+into a public graph image; sharing it can leave a copy in a chat service's image
+cache even after the modeled level changes.
 
 ## Defense in depth
 
@@ -44,6 +46,7 @@ load the dashboard. Confirm after deployment that:
 - unauthenticated `hrt.silky.moe` requests are intercepted by Access;
 - `e.silky.moe/api/state` returns 404;
 - `e.silky.moe/api/public` contains no dose or lab fields;
+- `e.silky.moe/api/embed.png` is a PNG and remains publicly reachable;
 - the `*.workers.dev` route is unavailable.
 
 ## Data recovery

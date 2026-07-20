@@ -81,6 +81,16 @@ export interface SimulationResult {
     auc: number;
 }
 
+export interface SimulationOptions {
+    /** Restrict the returned/evaluated grid without discarding earlier dose inputs. */
+    startTimeH?: number;
+    endTimeH?: number;
+    minSteps?: number;
+    maxSteps?: number;
+    pointsPerHour?: number;
+    includePeriEventSamples?: boolean;
+}
+
 // --- Lab Results & Calibration ---
 
 export interface LabResult {
@@ -311,6 +321,14 @@ export type CalibrationHistoryMode = 'forward' | 'retrospective';
 
 export const CALIBRATION_HISTORY_MODES: readonly CalibrationHistoryMode[] = ['forward', 'retrospective'];
 
+export interface CalibrationOptions {
+    /**
+     * Fit the personal clearance/half-life channel. Turning this off preserves
+     * the selected estimator's amplitude fit while avoiding its simulation grid.
+     */
+    fitClearance?: boolean;
+}
+
 /** Map legacy stored method ids onto the current estimator set. */
 export function normalizeCalibrationMethod(raw: string | null | undefined): CalibrationMethod {
     if (raw === 'off' || raw === 'ekf' || raw === 'ou_kalman' || raw === 'mipd') return raw;
@@ -475,6 +493,27 @@ function buildClearanceField(
         gLog.push(row);
     }
     return { logK, sims, gLog, baselineSim };
+}
+
+/**
+ * A zero-clearance-response field for CPU-bounded projections. Two identical,
+ * closely-spaced knots keep the shared interpolation/Jacobian helpers valid;
+ * both point at the baseline simulation, so only amplitude can be learned.
+ */
+function buildFixedClearanceField(
+    baselineSim: SimulationResult,
+    labTimes: number[],
+): ClearanceField {
+    const baselineLog = labTimes.map(t => {
+        const value = interpolateConcentration_E2(baselineSim, t);
+        return Math.log(value === null || Number.isNaN(value) || value < 1e-6 ? 1e-6 : value);
+    });
+    return {
+        logK: [-1e-6, 1e-6],
+        sims: [baselineSim, baselineSim],
+        gLog: [baselineLog, [...baselineLog]],
+        baselineSim,
+    };
 }
 
 /** Model log-E2 at lab i for log-clearance k (linear interpolation across grid). */
@@ -721,6 +760,7 @@ export function computeCalibration(
     results: LabResult[],
     method: CalibrationMethod = 'mipd',
     historyMode: CalibrationHistoryMode = 'retrospective',
+    options: CalibrationOptions = {},
 ): CalibrationResult {
     const points = computeCalibrationPoints(baselineSim, results);
     const identity: CalibrationResult = {
@@ -738,9 +778,14 @@ export function computeCalibration(
         return { method, ...out, n, points };
     }
 
-    // EKF and MIPD identify amplitude + clearance; both share the clearance field.
-    const allowClearance = n >= MIN_LABS_FOR_CLEARANCE;
-    const field = buildClearanceField(baselineSim, events, bodyWeightKG, labTimes);
+    // EKF and MIPD identify amplitude + clearance; both share the clearance
+    // field. Edge projections can retain the estimator's amplitude behavior
+    // while explicitly omitting the expensive 21-simulation clearance search.
+    const fitClearance = options.fitClearance !== false;
+    const allowClearance = fitClearance && n >= MIN_LABS_FOR_CLEARANCE;
+    const field = fitClearance
+        ? buildClearanceField(baselineSim, events, bodyWeightKG, labTimes)
+        : buildFixedClearanceField(baselineSim, labTimes);
 
     let factorFn: (timeH: number) => number;
     let aRep: number, kRep: number;
@@ -1432,7 +1477,12 @@ function computeMaxLifetimeH(params: PKParams, route: Route, allEvents: DoseEven
     return Math.ceil(13.816 / kMin);
 }
 
-export function runSimulation(events: DoseEvent[], bodyWeightKG: number, futureHorizonH = 24): SimulationResult | null {
+export function runSimulation(
+    events: DoseEvent[],
+    bodyWeightKG: number,
+    futureHorizonH = 24,
+    options: SimulationOptions = {},
+): SimulationResult | null {
     if (events.length === 0 || bodyWeightKG <= 0) return null;
 
     const sortedEvents = [...events].sort((a, b) => a.timeH - b.timeH);
@@ -1445,12 +1495,19 @@ export function runSimulation(events: DoseEvent[], bodyWeightKG: number, futureH
             return { model, ester: e.ester, startTimeH: e.timeH, maxLifetimeH };
         });
 
-    const startTime = sortedEvents[0].timeH - 24;
+    const naturalStartTime = sortedEvents[0].timeH - 24;
     const nowH = Date.now() / (1000 * 60 * 60);
-    const endTime = Math.max(
+    const naturalEndTime = Math.max(
         sortedEvents[sortedEvents.length - 1].timeH + (24 * 14),
         nowH + Math.max(24, futureHorizonH)
     );
+    const startTime = typeof options.startTimeH === 'number' && Number.isFinite(options.startTimeH)
+        ? options.startTimeH
+        : naturalStartTime;
+    const endTime = typeof options.endTimeH === 'number' && Number.isFinite(options.endTimeH)
+        ? options.endTimeH
+        : naturalEndTime;
+    if (endTime <= startTime) return null;
     // Adaptive step count: at least 1 point per hour, minimum 2000. The cap only
     // guards against a pathological/malformed event time (e.g. a bad timestamp
     // decades away) blowing up memory — at realistic usage spans (even several
@@ -1459,7 +1516,16 @@ export function runSimulation(events: DoseEvent[], bodyWeightKG: number, futureH
     // the curve visibly facets (straight-line segments, no smoothing) even when
     // zoomed into a recent window. See ResultChart's linePath().
     const totalHours = endTime - startTime;
-    const steps = Math.min(100000, Math.max(2000, Math.ceil(totalHours)));
+    const minSteps = Number.isFinite(options.minSteps)
+        ? Math.max(2, Math.floor(options.minSteps!))
+        : 2000;
+    const maxSteps = Number.isFinite(options.maxSteps)
+        ? Math.max(minSteps, Math.min(100000, Math.floor(options.maxSteps!)))
+        : 100000;
+    const pointsPerHour = Number.isFinite(options.pointsPerHour)
+        ? Math.max(0.01, options.pointsPerHour!)
+        : 1;
+    const steps = Math.min(maxSteps, Math.max(minSteps, Math.ceil(totalHours * pointsPerHour)));
 
     // Different Vd for E2, CPA and T
     const plasmaVolumeML_E2 = CorePK.vdPerKG * bodyWeightKG * 1000; // E2: ~2.0 L/kg
@@ -1481,19 +1547,23 @@ export function runSimulation(events: DoseEvent[], bodyWeightKG: number, futureH
     // with hundreds of events (e.g. daily recording for a year).
     const periEventOffsets = [0.25, 0.5, 1, 2, 4, 6, 8, 12, 24, 48];
     const periEventTimes: number[] = [];
-    for (const pc of precomputed) {
-        // Skip peri-event sampling for events whose contribution has fully decayed;
-        // their curves are smooth/zero and don't need dense peak capture.
-        if (pc.maxLifetimeH !== Infinity && endTime - pc.startTimeH > 2 * pc.maxLifetimeH) continue;
-        for (const offset of periEventOffsets) {
-            const t = pc.startTimeH + offset;
-            if (t >= startTime && t <= endTime) {
-                periEventTimes.push(t);
+    if (options.includePeriEventSamples !== false) {
+        for (const pc of precomputed) {
+            // Skip peri-event sampling for events whose contribution has fully decayed;
+            // their curves are smooth/zero and don't need dense peak capture.
+            if (pc.maxLifetimeH !== Infinity && endTime - pc.startTimeH > 2 * pc.maxLifetimeH) continue;
+            for (const offset of periEventOffsets) {
+                const t = pc.startTimeH + offset;
+                if (t >= startTime && t <= endTime) {
+                    periEventTimes.push(t);
+                }
             }
         }
     }
 
-    const eventTimes = sortedEvents.map(e => e.timeH);
+    const eventTimes = sortedEvents
+        .map(e => e.timeH)
+        .filter(timeH => timeH >= startTime && timeH <= endTime);
     const allTimes = Array.from(new Set([...gridTimes, ...eventTimes, ...periEventTimes])).sort((a, b) => a - b);
 
     // `precomputed` and `allTimes` are both sorted ascending by time, so which

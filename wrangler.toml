@@ -21,6 +21,9 @@ routes = [
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
+# The public document needs to pass through worker.ts so social crawlers receive
+# its server-rendered Open Graph tags. Hashed JS/CSS/images remain asset-first.
+run_worker_first = ["/", "/index.html", "/api/*"]
 
 # App configuration (public, non-secret).
 [vars]

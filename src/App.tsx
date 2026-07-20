@@ -76,6 +76,7 @@ const AppContent = () => {
         buildServerPayload,
         stateSignature,
         hydrateFromServer,
+        publicProjection,
     } = useAppData(showDialog);
 
     const {
@@ -172,8 +173,12 @@ const AppContent = () => {
                 const { data, updated_at } = await loadState();
                 if (cancelled) return;
                 if (data && typeof data === 'object' && data.modes) {
+                    const needsPublicProjectionBackfill = !data.publicProjection;
                     hydrateFromServer(data);
-                    lastSyncedSigRef.current = stateSignature();
+                    // Older rows predate the safe precomputed public snapshot.
+                    // Keep them dirty so the normal debounce writes one after
+                    // hydration has rebuilt the calibrated browser simulation.
+                    lastSyncedSigRef.current = needsPublicProjectionBackfill ? null : stateSignature();
                     lastServerUpdateRef.current = updated_at;
                 } else {
                     const payload = buildServerPayload();
@@ -186,8 +191,9 @@ const AppContent = () => {
                             lastServerUpdateRef.current = result.updated_at;
                         } catch (error) {
                             if (error instanceof StateConflictError && error.current.data?.modes) {
+                                const needsPublicProjectionBackfill = !error.current.data.publicProjection;
                                 hydrateFromServer(error.current.data);
-                                lastSyncedSigRef.current = stateSignature();
+                                lastSyncedSigRef.current = needsPublicProjectionBackfill ? null : stateSignature();
                                 lastServerUpdateRef.current = error.current.updated_at;
                             } else {
                                 throw error;
@@ -224,7 +230,7 @@ const AppContent = () => {
         saveTimerRef.current = setTimeout(() => syncNowRef.current(), 1200);
         return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [events, labResults, doseTemplates, quickDoses, weight, pkParams, calibrationMethod, calibrationHistoryMode]);
+    }, [events, labResults, doseTemplates, quickDoses, weight, pkParams, calibrationMethod, calibrationHistoryMode, publicProjection]);
 
     // Refresh from the server when the tab regains focus, so a change made on
     // another device shows up here — but only when there are no un-synced local

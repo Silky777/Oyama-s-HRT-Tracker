@@ -14,6 +14,12 @@ is served at `e.silky.moe`.
   multi-user stack. Cloudflare Access protects the editor host.
 - The public API computes the estimated hormone curve inside the Worker. It
   returns only the current modeled level and curve points, never doses or labs.
+- To stay within edge CPU limits, public EKF/MIPD projections retain their
+  amplitude calibration but omit the private editor's personal-clearance grid.
+  The authenticated editor continues to use the full calibration fit.
+- The public HTML includes server-rendered Open Graph metadata, and
+  `/api/embed.png` renders the same safe projection as a 600x315 graph card for
+  Discord and other link previews.
 - English is the default language. The existing language picker remains.
 
 The Worker stores one canonical JSON document in `app_state` and keeps the 20
@@ -100,6 +106,14 @@ The migration does not delete the old multi-user tables. If important data only
 exists in an old cloud backup, export or inspect it before removing the old
 deployment. Do not blindly copy an encrypted legacy `content.data` value into
 `app_state`; import the decrypted tracker export through the editor instead.
+
+## Social previews
+
+Sharing `https://e.silky.moe/` produces a snapshot of the modeled current level
+and curve at crawl time. Discord and other services cache unfurls, so an already
+posted preview does not update live. Use **Copy share link** on the public
+dashboard to copy a query-versioned URL when a guaranteed fresh re-scrape is
+needed.
 
 ## Docker
 
