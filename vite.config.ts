@@ -46,6 +46,14 @@ export default defineConfig(({ mode }) => {
           ]
         },
         workbox: {
+          // These navigations must reach Cloudflare's edge. In particular, the
+          // editor uses /__access_check after an API 401 so an installed PWA
+          // cannot keep serving its cached shell past Access-session expiry.
+          navigateFallbackDenylist: [
+            /^\/api\//,
+            /^\/cdn-cgi\//,
+            /^\/__access_check(?:\/|$)/,
+          ],
           runtimeCaching: [
             {
               urlPattern: /^https:\/\/cdn\.tailwindcss\.com\/.*/i,

@@ -7,7 +7,14 @@ import { APP_VERSION, AppTheme, PUBLIC_HOST } from './constants';
 import { DoseEvent, LabResult, decompressData, encryptData, decryptData } from '../logic';
 import { useAppData } from './hooks/useAppData';
 import { useAppNavigation, ViewKey } from './hooks/useAppNavigation';
-import { loadState, saveState, StateConflictError } from './services/state';
+import {
+    AccessSessionExpiredError,
+    clearAccessReauthenticationCheckpoint,
+    forceAccessReauthentication,
+    loadState,
+    saveState,
+    StateConflictError,
+} from './services/state';
 
 import WeightEditorModal from './components/WeightEditorModal';
 import DoseFormModal from './components/DoseFormModal';
@@ -126,7 +133,20 @@ const AppContent = () => {
     const saveInFlightRef = useRef(false);
     const saveAgainRef = useRef(false);
     const projectionSyncPendingRef = useRef(false);
+    const reauthenticationStartedRef = useRef(false);
     const syncNowRef = useRef<() => Promise<void>>(async () => {});
+
+    const beginAccessReauthentication = (error: unknown): boolean => {
+        if (!(error instanceof AccessSessionExpiredError)) return false;
+        if (reauthenticationStartedRef.current) return true;
+        reauthenticationStartedRef.current = true;
+        hydratedRef.current = false;
+        saveAgainRef.current = false;
+        if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+        if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+        forceAccessReauthentication();
+        return true;
+    };
 
     const scheduleRetry = () => {
         if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
@@ -172,7 +192,9 @@ const AppContent = () => {
             projectionSyncPendingRef.current = false;
             if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
         } catch (error) {
-            if (
+            if (beginAccessReauthentication(error)) {
+                return;
+            } else if (
                 projectionOnly &&
                 error instanceof StateConflictError &&
                 error.current.data?.modes &&
@@ -197,7 +219,7 @@ const AppContent = () => {
             }
         } finally {
             saveInFlightRef.current = false;
-            if (saveAgainRef.current) {
+            if (!reauthenticationStartedRef.current && saveAgainRef.current) {
                 saveAgainRef.current = false;
                 setTimeout(() => syncNowRef.current(), 0);
             }
@@ -244,12 +266,13 @@ const AppContent = () => {
                         lastServerUpdateRef.current = 0;
                     }
                 }
-            } catch {
+            } catch (error) {
+                if (beginAccessReauthentication(error)) return;
                 // Keep localStorage as the working cache and mark it dirty so it
                 // will be retried after connectivity returns.
                 lastSyncedSigRef.current = null;
             } finally {
-                if (!cancelled) {
+                if (!cancelled && !reauthenticationStartedRef.current) {
                     hydratedRef.current = true;
                     if (lastSyncedSigRef.current === null) scheduleRetry();
                 }
@@ -289,7 +312,9 @@ const AppContent = () => {
                     lastServerUpdateRef.current = updated_at;
                     if (isPublicProjectionDirty()) await syncNowRef.current();
                 }
-            } catch { /* ignore */ }
+            } catch (error) {
+                beginAccessReauthentication(error);
+            }
         };
         const onVis = () => { if (!document.hidden) refresh(); };
         const onOnline = () => syncNowRef.current();
@@ -729,6 +754,8 @@ const isPublicView = typeof window !== 'undefined' && (() => {
         new URLSearchParams(window.location.search).has('public');
     return host === PUBLIC_HOST || localPreview;
 })();
+
+if (!isPublicView) clearAccessReauthenticationCheckpoint();
 
 const App = () => (
     isPublicView ? (
